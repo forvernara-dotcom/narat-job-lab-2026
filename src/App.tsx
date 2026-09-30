@@ -1,63 +1,113 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
+import type { ChangeEvent } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 import { Search, Share2, CheckCircle, Plus, Pencil, X, Loader2 } from 'lucide-react';
 
 // ─────────────────────────────────────────────
-// Supabase 설정: 발급받은 URL과 Key가 주입된 완성 상태
+// Supabase 설정
 // ─────────────────────────────────────────────
 const SUPABASE_URL = 'https://rvhnvvszispxyrjdihqj.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ2aG52dnN6aXNweHlyamRpaHFqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA3ODEyMDMsImV4cCI6MjEwNjM1NzIwM30.1M4yy-NQ6k2ZuUJRz6pcl1JLdn8NC-1kIubfXvpknJQ';
+const SUPABASE_ANON_KEY =
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ2aG52dnN6aXNweHlyamRpaHFqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA3ODEyMDMsImV4cCI6MjEwNjM1NzIwM30.1M4yy-NQ6k2ZuUJRz6pcl1JLdn8NC-1kIubfXvpknJQ';
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+// ─────────────────────────────────────────────
+// 타입 정의
+// ─────────────────────────────────────────────
+type Evaluation = {
+  id: string;
+  attitude: number;
+  job: number;
+  communication: number;
+  comment: string | null;
+  created_at: string;
+};
+
+type Student = {
+  id: string;
+  name: string;
+  main_field: string | null;
+  program_name: string | null;
+  modules: string[] | null;
+  ojt_company: string | null;
+  created_at: string;
+  ojt_evaluations: Evaluation[] | null;
+};
+
+type AreaKey = 'attitude' | 'job' | 'communication';
+type Scores = Record<AreaKey, number | null>;
+
+type StudentForm = {
+  name: string;
+  main_field: string;
+  program_name: string;
+  modules: string;
+  ojt_company: string;
+};
+type TextField = 'name' | 'main_field' | 'program_name' | 'modules';
+
+type Message = { type: '' | 'error' | 'success'; text: string };
+
+// ─────────────────────────────────────────────
+// 상수
+// ─────────────────────────────────────────────
 const OJT_SITES = ['제과제빵 보조직무', '레스토랑 다정', '더불어삶'];
 
-const AREAS = [
+const AREAS: { key: AreaKey; label: string }[] = [
   { key: 'attitude', label: '태도 (출결, 성실성)' },
   { key: 'job', label: '직무 (업무 이해도)' },
   { key: 'communication', label: '소통 (지시 이행)' },
 ];
 
-const EMPTY_SCORES = { attitude: null, job: null, communication: null };
-const EMPTY_STUDENT_FORM = {
+const TEXT_FIELDS: { field: TextField; label: string; placeholder: string }[] = [
+  { field: 'name', label: '이름', placeholder: '예: 학생A' },
+  { field: 'main_field', label: '주전공', placeholder: '예: 제과제빵' },
+  { field: 'program_name', label: '교내 훈련 프로그램', placeholder: '예: 교내 제과 실습' },
+  { field: 'modules', label: '훈련 모듈 (쉼표로 구분)', placeholder: '예: 계량, 반죽, 포장' },
+];
+
+const EMPTY_SCORES: Scores = { attitude: null, job: null, communication: null };
+const EMPTY_STUDENT_FORM: StudentForm = {
   name: '',
   main_field: '',
   program_name: '',
   modules: '',
   ojt_company: OJT_SITES[0],
 };
+const EMPTY_MESSAGE: Message = { type: '', text: '' };
 
 // 가장 최근 평가 1건
-const getLatestEval = (student) => {
+const getLatestEval = (student: Student): Evaluation | null => {
   const evals = student.ojt_evaluations || [];
   if (evals.length === 0) return null;
-  return [...evals].sort((a, b) => new Date(b.created_at) - new Date(a.created_at))[0];
+  return [...evals].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
 };
 
 // 차트와 표가 함께 쓰는 단일 점수 기준: 최근 평가의 3개 영역 평균
-const getAverage = (evaluation) =>
+const getAverage = (evaluation: Evaluation | null): number | null =>
   evaluation
     ? Number(((evaluation.attitude + evaluation.job + evaluation.communication) / 3).toFixed(1))
     : null;
 
-export default function TransitionEduSaaS() {
-  const [students, setStudents] = useState([]);
+export default function App() {
+  const [students, setStudents] = useState<Student[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
-  const [viewMode, setViewMode] = useState('teacher'); // 'teacher' | 'employer'
-  const [selectedStudentId, setSelectedStudentId] = useState(null);
+  const [viewMode, setViewMode] = useState<'teacher' | 'employer'>('teacher');
+  const [selectedStudentId, setSelectedStudentId] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
 
   // 사업체 평가서 상태
-  const [scores, setScores] = useState(EMPTY_SCORES);
+  const [scores, setScores] = useState<Scores>(EMPTY_SCORES);
   const [comment, setComment] = useState('');
   const [submitting, setSubmitting] = useState(false);
-  const [submitMessage, setSubmitMessage] = useState({ type: '', text: '' });
+  const [submitMessage, setSubmitMessage] = useState<Message>(EMPTY_MESSAGE);
 
   // 학생 추가/수정 모달 상태
   const [modalOpen, setModalOpen] = useState(false);
-  const [editingId, setEditingId] = useState(null);
-  const [studentForm, setStudentForm] = useState(EMPTY_STUDENT_FORM);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [studentForm, setStudentForm] = useState<StudentForm>(EMPTY_STUDENT_FORM);
   const [saving, setSaving] = useState(false);
   const [modalError, setModalError] = useState('');
 
@@ -74,7 +124,7 @@ export default function TransitionEduSaaS() {
     if (error) {
       setLoadError(`학생 데이터를 불러오지 못했습니다: ${error.message}`);
     } else {
-      setStudents(data || []);
+      setStudents((data as Student[]) || []);
     }
     setLoading(false);
   }, []);
@@ -103,12 +153,13 @@ export default function TransitionEduSaaS() {
   };
 
   const handleSubmitEvaluation = async () => {
-    setSubmitMessage({ type: '', text: '' });
+    setSubmitMessage(EMPTY_MESSAGE);
     if (!selectedStudent) {
       setSubmitMessage({ type: 'error', text: '평가할 학생을 선택해 주십시오.' });
       return;
     }
-    if (Object.values(scores).some((v) => v === null)) {
+    const { attitude, job, communication } = scores;
+    if (attitude === null || job === null || communication === null) {
       setSubmitMessage({ type: 'error', text: '태도, 직무, 소통 세 영역 모두 점수를 선택해 주십시오.' });
       return;
     }
@@ -116,9 +167,9 @@ export default function TransitionEduSaaS() {
     setSubmitting(true);
     const { error } = await supabase.from('ojt_evaluations').insert({
       student_id: selectedStudent.id,
-      attitude: scores.attitude,
-      job: scores.job,
-      communication: scores.communication,
+      attitude,
+      job,
+      communication,
       comment: comment.trim() || null,
     });
     setSubmitting(false);
@@ -135,7 +186,7 @@ export default function TransitionEduSaaS() {
   const openEmployerView = () => {
     if (!selectedStudentId && students.length > 0) setSelectedStudentId(students[0].id);
     resetEvaluationForm();
-    setSubmitMessage({ type: '', text: '' });
+    setSubmitMessage(EMPTY_MESSAGE);
     setViewMode('employer');
   };
 
@@ -147,7 +198,7 @@ export default function TransitionEduSaaS() {
     setModalOpen(true);
   };
 
-  const openEditModal = (student) => {
+  const openEditModal = (student: Student) => {
     setEditingId(student.id);
     setStudentForm({
       name: student.name || '',
@@ -192,7 +243,8 @@ export default function TransitionEduSaaS() {
     fetchStudents();
   };
 
-  const updateField = (field) => (e) => setStudentForm((prev) => ({ ...prev, [field]: e.target.value }));
+  const updateField = (field: TextField) => (e: ChangeEvent<HTMLInputElement>) =>
+    setStudentForm((prev) => ({ ...prev, [field]: e.target.value }));
 
   // ─────────────────────────────────────────────
   // 사업체 평가서
@@ -209,7 +261,7 @@ export default function TransitionEduSaaS() {
             value={selectedStudentId || ''}
             onChange={(e) => {
               setSelectedStudentId(e.target.value || null);
-              setSubmitMessage({ type: '', text: '' });
+              setSubmitMessage(EMPTY_MESSAGE);
             }}
             className="w-full border border-gray-300 p-2 text-sm focus:outline-none focus:border-gray-900 bg-white"
           >
@@ -290,7 +342,7 @@ export default function TransitionEduSaaS() {
   // 학생 추가/수정 모달
   // ─────────────────────────────────────────────
   const renderStudentModal = () => (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-40 p-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
       <div className="w-full max-w-md bg-white p-6 border-t-4 border-gray-900 shadow-sm">
         <div className="flex justify-between items-start mb-6">
           <div>
@@ -303,12 +355,7 @@ export default function TransitionEduSaaS() {
         </div>
 
         <div className="space-y-4">
-          {[
-            { field: 'name', label: '이름', placeholder: '예: 김민수' },
-            { field: 'main_field', label: '주전공', placeholder: '예: 제과제빵' },
-            { field: 'program_name', label: '교내 훈련 프로그램', placeholder: '예: 교내 제과 실습' },
-            { field: 'modules', label: '훈련 모듈 (쉼표로 구분)', placeholder: '예: 계량, 반죽, 포장' },
-          ].map(({ field, label, placeholder }) => (
+          {TEXT_FIELDS.map(({ field, label, placeholder }) => (
             <div key={field}>
               <label className="block text-sm font-semibold text-gray-700 mb-2">{label}</label>
               <input
