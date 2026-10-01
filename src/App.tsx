@@ -32,6 +32,9 @@ import {
   RefreshCw,
   Users,
   UserCog,
+  Search,
+  ChevronDown,
+  ChevronRight,
   X,
 } from 'lucide-react';
 
@@ -1042,6 +1045,15 @@ function TeacherApp({
   const [arrivals, setArrivals] = useState<Arrival[]>([]);
   const [unseen, setUnseen] = useState<Record<string, number>>({});
   const [liveStatus, setLiveStatus] = useState<LiveStatus>('connecting');
+  const [studentQuery, setStudentQuery] = useState('');
+  const [groupByGrade, setGroupByGrade] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('pf-group-by-grade') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const [collapsedGrades, setCollapsedGrades] = useState<Record<string, boolean>>({});
   const savingKeyRef = useRef<string | null>(null); // 내가 지금 저장 중인 평가 (알림 중복 방지)
   const studentsRef = useRef<Student[]>([]);
 
@@ -1120,6 +1132,32 @@ function TeacherApp({
   }, [fetchStudents]);
 
   const dismissArrival = (id: string) => setArrivals((prev) => prev.filter((a) => a.id !== id));
+
+  // ── 학생 검색 (이름·직무·실습처) / 학년별 묶기 ──
+  const filteredStudents = useMemo(() => {
+    const q = studentQuery.trim().toLowerCase();
+    if (!q) return students;
+    return students.filter((st) => [st.name, st.mainField, st.site].some((v) => v.toLowerCase().includes(q)));
+  }, [students, studentQuery]);
+
+  const gradeGroups = useMemo(() => {
+    const order = [...GRADES, ...Array.from(new Set(filteredStudents.map((st) => st.grade))).filter((g) => !GRADES.includes(g))];
+    return order
+      .map((grade) => ({
+        grade,
+        list: filteredStudents.filter((st) => st.grade === grade).sort((a, b) => a.name.localeCompare(b.name, 'ko')),
+      }))
+      .filter((g) => g.list.length > 0);
+  }, [filteredStudents]);
+
+  const toggleGroupByGrade = (on: boolean) => {
+    setGroupByGrade(on);
+    try {
+      localStorage.setItem('pf-group-by-grade', on ? '1' : '0');
+    } catch {
+      // 저장 실패는 무시 (다음 접속 때 기본값 사용)
+    }
+  };
 
   const fieldOptions = useMemo(
     () => Array.from(new Set([...FIELD_SUGGESTIONS, ...students.map((s) => s.mainField)])).filter(Boolean),
@@ -1433,6 +1471,59 @@ function TeacherApp({
     </button>
   );
 
+  const renderStudentItem = (s: Student) => {
+    const active = s.id === selectedId;
+    const last = s.evaluations[s.evaluations.length - 1];
+    return (
+      <li key={s.id}>
+        <div
+          role="button"
+          tabIndex={0}
+          onClick={() => selectStudent(s.id)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') selectStudent(s.id);
+          }}
+          className={`flex items-center justify-between gap-3 py-4 pl-3 pr-2 cursor-pointer transition-colors ${
+            active ? 'bg-neutral-900 text-white' : 'hover:bg-neutral-100'
+          }`}
+        >
+          <div className="min-w-0">
+            <p className="font-bold truncate">
+              {s.name} <span className={`text-xs font-normal ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>{s.grade}</span>
+              {unseen[s.id] ? (
+                <span
+                  className={`ml-2 px-1.5 py-0.5 text-[10px] font-bold align-middle ${
+                    active ? 'bg-white text-neutral-900' : 'bg-neutral-900 text-white'
+                  }`}
+                >
+                  새 평가 {unseen[s.id]}
+                </span>
+              ) : null}
+            </p>
+            <p className={`text-xs truncate ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>
+              {s.mainField}
+              {s.site ? ` / ${s.site}` : ''}
+            </p>
+            <p className={`text-[11px] mt-1 ${active ? 'text-neutral-400' : 'text-neutral-400'}`}>
+              평가 {s.evaluations.length}건{last ? ` · 최근 ${last.evaluated_at}` : ''}
+            </p>
+          </div>
+          <button
+            type="button"
+            aria-label={`${s.name} 삭제`}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleDeleteStudent(s);
+            }}
+            className={`p-1.5 shrink-0 ${active ? 'hover:bg-neutral-700' : 'hover:bg-neutral-200'}`}
+          >
+            <Trash2 size={15} />
+          </button>
+        </div>
+      </li>
+    );
+  };
+
   // ── 좌측 Master ──
   const renderSidebar = () => (
     <aside className="border-b-2 lg:border-b-0 lg:border-r-2 border-neutral-900 p-8 space-y-10 print:hidden">
@@ -1473,69 +1564,75 @@ function TeacherApp({
       <div>
         <h2 className="text-sm font-bold pb-3 border-b-2 border-neutral-900 flex justify-between">
           <span>학생 목록</span>
-          <span className="font-normal text-neutral-500">{students.length}명</span>
+          <span className="font-normal text-neutral-500">
+            {studentQuery.trim() ? `${filteredStudents.length} / ${students.length}명` : `${students.length}명`}
+          </span>
         </h2>
+        {students.length > 0 && (
+          <div className="space-y-2 pt-3 pb-1">
+            <div className="relative">
+              <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
+              <input
+                className={`${inputClass} pl-9`}
+                placeholder="이름 · 직무 · 실습처 검색"
+                value={studentQuery}
+                onChange={(e) => setStudentQuery(e.target.value)}
+                aria-label="학생 검색"
+              />
+            </div>
+            <div className="grid grid-cols-2 border-2 border-neutral-900 text-xs font-bold">
+              {[
+                { on: false, label: '전체 목록' },
+                { on: true, label: '학년별 묶기' },
+              ].map((opt, i) => (
+                <button
+                  key={opt.label}
+                  type="button"
+                  aria-pressed={groupByGrade === opt.on}
+                  onClick={() => toggleGroupByGrade(opt.on)}
+                  className={`py-1.5 transition-colors ${i > 0 ? 'border-l-2 border-neutral-900' : ''} ${
+                    groupByGrade === opt.on ? 'bg-neutral-900 text-white' : 'hover:bg-neutral-100'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
         {loading ? (
           <p className="text-sm text-neutral-500 py-6 flex items-center gap-2">
             <Loader2 size={16} className="animate-spin" /> 불러오는 중...
           </p>
         ) : students.length === 0 ? (
           <p className="text-sm text-neutral-500 py-6">등록된 학생이 없습니다. 위 양식에서 추가하세요.</p>
-        ) : (
-          <ul className="divide-y divide-neutral-200">
-            {students.map((s) => {
-              const active = s.id === selectedId;
-              const last = s.evaluations[s.evaluations.length - 1];
+        ) : filteredStudents.length === 0 ? (
+          <p className="text-sm text-neutral-500 py-6">'{studentQuery.trim()}'에 해당하는 학생이 없습니다.</p>
+        ) : groupByGrade ? (
+          <div>
+            {gradeGroups.map((g) => {
+              const collapsed = !studentQuery.trim() && collapsedGrades[g.grade];
               return (
-                <li key={s.id}>
-                  <div
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => selectStudent(s.id)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') selectStudent(s.id);
-                    }}
-                    className={`flex items-center justify-between gap-3 py-4 pl-3 pr-2 cursor-pointer transition-colors ${
-                      active ? 'bg-neutral-900 text-white' : 'hover:bg-neutral-100'
-                    }`}
+                <div key={g.grade}>
+                  <button
+                    type="button"
+                    onClick={() => setCollapsedGrades((prev) => ({ ...prev, [g.grade]: !prev[g.grade] }))}
+                    aria-expanded={!collapsed}
+                    className="w-full flex items-center justify-between py-2.5 mt-2 border-b-2 border-neutral-900 text-sm font-bold"
                   >
-                    <div className="min-w-0">
-                      <p className="font-bold truncate">
-                        {s.name} <span className={`text-xs font-normal ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>{s.grade}</span>
-                        {unseen[s.id] ? (
-                          <span
-                            className={`ml-2 px-1.5 py-0.5 text-[10px] font-bold align-middle ${
-                              active ? 'bg-white text-neutral-900' : 'bg-neutral-900 text-white'
-                            }`}
-                          >
-                            새 평가 {unseen[s.id]}
-                          </span>
-                        ) : null}
-                      </p>
-                      <p className={`text-xs truncate ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>
-                        {s.mainField}
-                        {s.site ? ` / ${s.site}` : ''}
-                      </p>
-                      <p className={`text-[11px] mt-1 ${active ? 'text-neutral-400' : 'text-neutral-400'}`}>
-                        평가 {s.evaluations.length}건{last ? ` · 최근 ${last.evaluated_at}` : ''}
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      aria-label={`${s.name} 삭제`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleDeleteStudent(s);
-                      }}
-                      className={`p-1.5 shrink-0 ${active ? 'hover:bg-neutral-700' : 'hover:bg-neutral-200'}`}
-                    >
-                      <Trash2 size={15} />
-                    </button>
-                  </div>
-                </li>
+                    <span className="flex items-center gap-1.5">
+                      {collapsed ? <ChevronRight size={15} /> : <ChevronDown size={15} />}
+                      {g.grade}
+                    </span>
+                    <span className="font-normal text-neutral-500 text-xs">{g.list.length}명</span>
+                  </button>
+                  {!collapsed && <ul className="divide-y divide-neutral-200">{g.list.map((st) => renderStudentItem(st))}</ul>}
+                </div>
               );
             })}
-          </ul>
+          </div>
+        ) : (
+          <ul className="divide-y divide-neutral-200">{filteredStudents.map((st) => renderStudentItem(st))}</ul>
         )}
       </div>
     </aside>
@@ -2095,6 +2192,19 @@ function TeacherApp({
           <p className="text-sm text-neutral-500 py-8">등록된 학생이 없습니다. 학생 대시보드에서 먼저 학생을 추가하세요.</p>
         ) : (
           <div className="overflow-x-auto mt-6">
+            <div className="relative max-w-sm mb-4">
+              <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral-400" />
+              <input
+                className={`${inputClass} pl-9`}
+                placeholder="이름 · 직무 · 실습처 검색"
+                value={studentQuery}
+                onChange={(e) => setStudentQuery(e.target.value)}
+                aria-label="학생 검색"
+              />
+            </div>
+            {filteredStudents.length === 0 && (
+              <p className="text-sm text-neutral-500 py-4">'{studentQuery.trim()}'에 해당하는 학생이 없습니다.</p>
+            )}
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b-2 border-neutral-900 text-left">
@@ -2105,7 +2215,7 @@ function TeacherApp({
                 </tr>
               </thead>
               <tbody className="divide-y divide-neutral-200">
-                {students.map((s) => {
+                {filteredStudents.map((s) => {
                   const lastOjt = latestOf(s.evaluations, 'ojt');
                   const lastSelf = latestOf(s.evaluations, 'self');
                   const linkCell = (kind: LinkKind, last: EvaluationRow | null) => (
