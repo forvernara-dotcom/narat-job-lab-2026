@@ -35,6 +35,7 @@ import {
   Search,
   ChevronDown,
   ChevronRight,
+  ChevronLeft,
   X,
 } from 'lucide-react';
 
@@ -49,7 +50,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const STUDENTS_TABLE = 'portfolio_students';
 const EVALUATIONS_TABLE = 'portfolio_evaluations';
 const PROFILES_TABLE = 'portfolio_profiles';
-const EVAL_COLUMNS = 'id, student_id, kind, scores, summary, comment, evaluator, evaluated_at, created_at';
+const EVAL_COLUMNS = 'id, student_id, kind, scores, summary, comment, evaluator, input_method, evaluated_at, created_at';
 const STUDENT_COLUMNS = 'id, name, grade, main_field, site, created_at, self_token, employer_token';
 const PROFILE_COLUMNS = 'id, email, name, school, role, created_at';
 
@@ -58,6 +59,8 @@ const PROFILE_COLUMNS = 'id, email, name, school, role, created_at';
 // ─────────────────────────────────────────────
 type Kind = 'ojt' | 'teacher' | 'self';
 type StaffKind = 'ojt' | 'teacher';
+type InputMethod = 'link' | 'phone' | 'paper' | 'interview';
+type ProxyMethod = Exclude<InputMethod, 'link'>;
 type LinkKind = 'ojt' | 'self';
 type Role = 'pending' | 'teacher' | 'admin';
 type FormMessage = { type: 'ok' | 'error'; text: string };
@@ -97,7 +100,8 @@ type EvaluationRow = {
   scores: Record<string, number>;
   summary: string | null;
   comment: string;
-  evaluator: string | null; // 링크로 평가한 사장님 성함 (선택)
+  evaluator: string | null; // 평가한 사장님 성함
+  input_method: InputMethod | null; // 'link' 직접 제출 / 그 외 교사 대리 입력 방식
   evaluated_at: string;
   created_at: string;
 };
@@ -136,6 +140,22 @@ type Draft = {
   scores: Record<string, number>;
   summary: string | null;
   comment: string;
+  method: ProxyMethod | null; // 고용주 평가 대리 입력 방식
+  evaluator: string; // 고용주 평가 대리 입력 시 사장님 성함
+};
+
+const PROXY_METHODS: { value: ProxyMethod; label: string }[] = [
+  { value: 'phone', label: '전화 평가' },
+  { value: 'paper', label: '종이 평가지' },
+  { value: 'interview', label: '현장 면담' },
+];
+
+// 평가가 어떤 경로로 들어왔는지 표시 (3자 비교 해석용)
+const sourceLabel = (row: { kind: Kind; input_method: InputMethod | null }) => {
+  if (row.kind !== 'ojt') return '';
+  if (row.input_method === 'link') return '사장님 링크 직접 제출';
+  const m = PROXY_METHODS.find((x) => x.value === row.input_method);
+  return m ? `교사 대리 입력 · ${m.label}` : '';
 };
 
 // ─────────────────────────────────────────────
@@ -372,7 +392,15 @@ const today = () => {
   const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
   return local.toISOString().slice(0, 10);
 };
-const emptyDraft = (kind: StaffKind): Draft => ({ kind, date: today(), scores: {}, summary: null, comment: '' });
+const emptyDraft = (kind: StaffKind): Draft => ({
+  kind,
+  date: today(),
+  scores: {},
+  summary: null,
+  comment: '',
+  method: null,
+  evaluator: '',
+});
 const linkFor = (kind: LinkKind, token: string) =>
   `${window.location.origin}${window.location.pathname}?view=${kind}&t=${encodeURIComponent(token)}`;
 
@@ -403,7 +431,7 @@ const PRINT_CSS = `
 `;
 
 const inputClass =
-  'w-full border-2 border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:border-neutral-900 bg-white';
+  'w-full border-2 border-neutral-300 px-3 py-2 text-base md:text-sm focus:outline-none focus:border-neutral-900 bg-white';
 
 // ─────────────────────────────────────────────
 // 4. 라우팅
@@ -499,10 +527,10 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
 
   const shell = (children: ReactNode) => (
     <div className="min-h-screen bg-white text-neutral-900 font-sans">
-      <header className="border-b-4 border-neutral-900 px-6 py-4">
+      <header className="border-b-4 border-neutral-900 px-4 py-3 sm:px-6 sm:py-4">
         <p className="text-lg font-black tracking-tighter">Link-路 <span className="font-bold text-neutral-500">나라T 직업교육 Lab</span></p>
       </header>
-      <main className="max-w-2xl mx-auto px-6 py-10">{children}</main>
+      <main className="max-w-2xl mx-auto px-4 py-6 sm:px-6 sm:py-10">{children}</main>
     </div>
   );
 
@@ -542,13 +570,13 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
       <div>
         {isSelf ? (
           <>
-            <h1 className="text-3xl font-black tracking-tight">{ctx.name}님의 자기평가</h1>
+            <h1 className="text-2xl sm:text-3xl font-black tracking-tight">{ctx.name}님의 자기평가</h1>
             <p className="text-lg text-neutral-600 mt-3 leading-relaxed">요즘 일할 때 나의 모습을 생각하며, 질문마다 하나씩 골라 주세요.</p>
           </>
         ) : (
           <>
             <p className="text-sm text-neutral-500">현장실습(OJT) 평가</p>
-            <h1 className="text-3xl font-black tracking-tight mt-1">{ctx.name} 학생</h1>
+            <h1 className="text-2xl sm:text-3xl font-black tracking-tight mt-1">{ctx.name} 학생</h1>
             <p className="text-sm text-neutral-600 mt-2">
               {[ctx.site, ctx.main_field, ctx.grade].filter(Boolean).join(' · ')}
             </p>
@@ -658,7 +686,7 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
           onChange={(e) => setComment(e.target.value)}
           maxLength={2000}
           placeholder={rubric.commentPlaceholder}
-          className={`w-full h-36 border-2 border-neutral-300 p-4 focus:outline-none focus:border-neutral-900 ${isSelf ? 'text-lg' : 'text-sm leading-relaxed'}`}
+          className={`w-full h-36 border-2 border-neutral-300 p-4 focus:outline-none focus:border-neutral-900 ${isSelf ? 'text-lg' : 'text-base leading-relaxed'}`}
         />
         {!isSelf && (
           <div className="mt-4">
@@ -705,7 +733,7 @@ function AuthShell({ title, children }: { title: string; children: ReactNode }) 
       <div className="w-full max-w-sm">
         <p className="text-2xl font-black tracking-tighter">Link-路 <span className="font-bold text-neutral-500">나라T 직업교육 Lab</span></p>
         <p className="text-sm text-neutral-500 mt-1 mb-8">현장실습 직무 역량 평가</p>
-        <div className="border-2 border-neutral-900 p-8">
+        <div className="border-2 border-neutral-900 p-6 sm:p-8">
           <h1 className="text-lg font-bold border-b-4 border-neutral-900 pb-2 mb-6">{title}</h1>
           {children}
         </div>
@@ -1022,7 +1050,7 @@ function TeacherApp({
   const [form, setForm] = useState({ name: '', grade: GRADES[0], mainField: '', site: '' });
   const [formError, setFormError] = useState('');
   const [adding, setAdding] = useState(false);
-  const [draft, setDraft] = useState<Draft>(emptyDraft('ojt'));
+  const [draft, setDraft] = useState<Draft>(emptyDraft('teacher'));
   const [draftError, setDraftError] = useState('');
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState('');
@@ -1054,6 +1082,8 @@ function TeacherApp({
     }
   });
   const [collapsedGrades, setCollapsedGrades] = useState<Record<string, boolean>>({});
+  const [mobilePane, setMobilePane] = useState<'list' | 'detail'>('list'); // 휴대폰: 목록 ↔ 상세 전환
+  const [showAddForm, setShowAddForm] = useState(false); // 휴대폰: 학생 추가 양식 접기
   const savingKeyRef = useRef<string | null>(null); // 내가 지금 저장 중인 평가 (알림 중복 방지)
   const studentsRef = useRef<Student[]>([]);
 
@@ -1166,6 +1196,8 @@ function TeacherApp({
 
   const selectStudent = (id: string) => {
     setSelectedId(id);
+    setMobilePane('detail');
+    if (window.innerWidth < 768) window.scrollTo({ top: 0 });
     setUnseen((prev) => {
       if (!prev[id]) return prev;
       const next = { ...prev };
@@ -1201,6 +1233,7 @@ function TeacherApp({
     selectStudent(student.id);
     setTab('new');
     setForm({ name: '', grade: form.grade, mainField: '', site: '' });
+    setShowAddForm(false);
   };
 
   const handleDeleteStudent = async (student: Student) => {
@@ -1218,7 +1251,7 @@ function TeacherApp({
   // ── 새 평가 저장 (누적 insert) ──
   const changeDraftKind = (kind: StaffKind) => {
     if (kind === draft.kind) return;
-    const hasInput = Object.keys(draft.scores).length > 0 || draft.comment.trim() !== '';
+    const hasInput = Object.keys(draft.scores).length > 0 || draft.comment.trim() !== '' || draft.evaluator.trim() !== '';
     if (hasInput && !window.confirm('입력 중인 내용이 지워집니다. 평가 종류를 바꿀까요?')) return;
     setDraft(emptyDraft(kind));
     setDraftError('');
@@ -1234,6 +1267,14 @@ function TeacherApp({
     }
     if (!draft.summary) {
       setDraftError(`${rubric.summaryTitle}을(를) 선택하십시오.`);
+      return;
+    }
+    if (draft.kind === 'ojt' && !draft.method) {
+      setDraftError('대리 입력 방식(전화 평가 / 종이 평가지 / 현장 면담)을 선택하십시오.');
+      return;
+    }
+    if (draft.kind === 'ojt' && !draft.evaluator.trim()) {
+      setDraftError('평가해 주신 사장님(담당자) 성함을 입력하십시오.');
       return;
     }
     if (!draft.date) {
@@ -1252,6 +1293,8 @@ function TeacherApp({
         summary: draft.summary,
         comment: draft.comment.trim(),
         evaluated_at: draft.date,
+        input_method: draft.kind === 'ojt' ? draft.method : null,
+        evaluator: draft.kind === 'ojt' ? draft.evaluator.trim() : null,
       })
       .select(EVAL_COLUMNS)
       .single();
@@ -1427,7 +1470,7 @@ function TeacherApp({
   const renderNav = () => (
     <nav
       aria-label="주요 메뉴"
-      className="w-20 shrink-0 bg-neutral-900 text-white flex flex-col items-center py-5 gap-3 sticky top-0 h-screen print:hidden"
+      className="hidden md:flex w-20 shrink-0 bg-neutral-900 text-white flex-col items-center py-5 gap-3 sticky top-0 h-screen print:hidden"
     >
       <div className="w-11 h-11 border-2 border-white flex items-center justify-center font-black text-lg mb-4" title="Link-路">路</div>
       {navItems.map((item) => {
@@ -1458,12 +1501,36 @@ function TeacherApp({
     </nav>
   );
 
+  const renderBottomNav = () => (
+    <nav
+      aria-label="주요 메뉴"
+      className="md:hidden fixed bottom-0 inset-x-0 z-40 bg-neutral-900 text-white flex pb-[env(safe-area-inset-bottom)] print:hidden"
+    >
+      {navItems.map((item) => {
+        const active = nav === item.key;
+        return (
+          <button
+            key={item.key}
+            type="button"
+            aria-current={active ? 'page' : undefined}
+            onClick={() => setNav(item.key)}
+            className={`flex-1 flex flex-col items-center gap-1 pt-2.5 pb-1.5 transition-colors ${active ? 'text-white' : 'text-neutral-500'}`}
+          >
+            {item.icon}
+            <span className="text-[10px] font-bold">{item.label}</span>
+            <span className={`h-0.5 w-6 ${active ? 'bg-white' : 'bg-transparent'}`} />
+          </button>
+        );
+      })}
+    </nav>
+  );
+
   const copyButton = (student: Student, kind: LinkKind, compact = false) => (
     <button
       type="button"
       onClick={() => copyLink(student, kind)}
       className={`flex items-center gap-2 border-2 border-neutral-900 text-sm font-bold hover:bg-neutral-900 hover:text-white transition-colors ${
-        compact ? 'px-3 py-1.5' : 'px-4 py-2'
+        compact ? 'px-3 py-2' : 'px-3 py-1.5 sm:px-4 sm:py-2'
       }`}
     >
       {copiedKey === `${student.id}:${kind}` ? <Check size={15} /> : <Copy size={15} />}
@@ -1526,8 +1593,21 @@ function TeacherApp({
 
   // ── 좌측 Master ──
   const renderSidebar = () => (
-    <aside className="border-b-2 lg:border-b-0 lg:border-r-2 border-neutral-900 p-8 space-y-10 print:hidden">
-      <form onSubmit={handleAdd} className="space-y-3">
+    <aside
+      className={`md:border-r-2 border-neutral-900 p-4 md:p-6 lg:p-8 space-y-6 md:space-y-10 print:hidden ${
+        mobilePane === 'detail' ? 'hidden md:block' : ''
+      }`}
+    >
+      <button
+        type="button"
+        onClick={() => setShowAddForm((v) => !v)}
+        aria-expanded={showAddForm}
+        className="md:hidden w-full flex items-center justify-center gap-2 border-2 border-neutral-900 text-sm font-bold py-3"
+      >
+        {showAddForm ? <X size={16} /> : <UserPlus size={16} />}
+        {showAddForm ? '학생 추가 닫기' : '학생 추가'}
+      </button>
+      <form onSubmit={handleAdd} className={`space-y-3 ${showAddForm ? 'block' : 'hidden'} md:block`}>
         <h2 className="text-sm font-bold pb-3 border-b-2 border-neutral-900">학생 추가</h2>
         <input className={inputClass} placeholder="학생 이름" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
         <select className={inputClass} value={form.grade} onChange={(e) => setForm({ ...form, grade: e.target.value })} aria-label="학년">
@@ -1643,11 +1723,11 @@ function TeacherApp({
     const rubric = RUBRICS[draft.kind];
     return (
       <div className="space-y-10 print:hidden">
-        <section className="grid grid-cols-1 md:grid-cols-[1fr_220px] gap-6 items-end">
+        <section className="grid grid-cols-1 lg:grid-cols-[1fr_220px] gap-6 items-end">
           <div>
             <p className="text-sm font-semibold mb-3">평가 종류</p>
             <div className="grid grid-cols-2 border-2 border-neutral-900">
-              {(['ojt', 'teacher'] as StaffKind[]).map((k, i) => (
+              {(['teacher', 'ojt'] as StaffKind[]).map((k, i) => (
                 <button
                   key={k}
                   type="button"
@@ -1657,7 +1737,7 @@ function TeacherApp({
                     draft.kind === k ? 'bg-neutral-900 text-white' : 'hover:bg-neutral-100'
                   }`}
                 >
-                  {RUBRICS[k].label} 평가
+                  {k === 'teacher' ? '교사 평가' : '고용주 평가 대리 입력'}
                 </button>
               ))}
             </div>
@@ -1675,6 +1755,54 @@ function TeacherApp({
             />
           </div>
         </section>
+
+        {draft.kind === 'ojt' && (
+          <section className="space-y-5">
+            <div className="border-2 border-neutral-900 p-4 sm:p-5 space-y-3">
+              <p className="text-sm leading-relaxed">
+                고용주 평가는 <b>사장님이 링크로 직접 제출하는 것이 원칙</b>입니다. 링크를 쓰기 어려운 경우(전화로 구두 평가, 종이
+                평가지, 현장 면담)에만 대리 입력하십시오. 대리 입력한 기록은 히스토리와 리포트에 "교사 대리 입력"으로 구분되어 표시됩니다.
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs text-neutral-500">링크로 받으려면</span>
+                {copyButton(s, 'ojt', true)}
+              </div>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-[1fr_220px] gap-6 items-end">
+              <div>
+                <p className="text-sm font-semibold mb-3">대리 입력 방식</p>
+                <div className="grid grid-cols-3 border-2 border-neutral-900">
+                  {PROXY_METHODS.map((m, i) => (
+                    <button
+                      key={m.value}
+                      type="button"
+                      aria-pressed={draft.method === m.value}
+                      onClick={() => setDraft({ ...draft, method: m.value })}
+                      className={`py-3 text-sm font-bold transition-colors ${i > 0 ? 'border-l-2 border-neutral-900' : ''} ${
+                        draft.method === m.value ? 'bg-neutral-900 text-white' : 'hover:bg-neutral-100'
+                      }`}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <label htmlFor="proxy-evaluator" className="block text-sm font-semibold mb-3">
+                  평가한 사장님 성함
+                </label>
+                <input
+                  id="proxy-evaluator"
+                  value={draft.evaluator}
+                  onChange={(e) => setDraft({ ...draft, evaluator: e.target.value })}
+                  maxLength={50}
+                  placeholder="예: 홍길동 점장"
+                  className={inputClass}
+                />
+              </div>
+            </div>
+          </section>
+        )}
 
         {draft.kind === 'teacher' && !TEACHER_TARGET_GRADES.includes(s.grade) && (
           <p className="text-sm border-l-4 border-neutral-900 pl-3 py-1">
@@ -1700,8 +1828,8 @@ function TeacherApp({
           const sum = ids.reduce((acc, id) => acc + (draft.scores[id] ?? 0), 0);
           return (
             <section key={domain.key}>
-              <div className="flex justify-between items-end border-b-4 border-neutral-900 pb-2 mb-1">
-                <h3 className="text-lg font-bold">
+              <div className="flex justify-between items-end gap-3 border-b-4 border-neutral-900 pb-2 mb-1">
+                <h3 className="text-base sm:text-lg font-bold">
                   {di + 1}. {domain.title}
                 </h3>
                 <p className="text-sm tabular-nums">
@@ -1711,9 +1839,9 @@ function TeacherApp({
               </div>
               <div className="divide-y divide-neutral-200">
                 {domain.items.map((item) => (
-                  <div key={item.id} className="flex flex-col md:flex-row md:items-center justify-between gap-3 py-4">
+                  <div key={item.id} className="flex flex-col xl:flex-row xl:items-center justify-between gap-3 py-4">
                     <p className="text-sm font-semibold">{item.label}</p>
-                    <div className="grid grid-cols-4 gap-2 md:w-[420px]">
+                    <div className="grid grid-cols-4 gap-2 xl:w-[420px] xl:shrink-0">
                       {rubric.scale.map((sc) => {
                         const active = draft.scores[item.id] === sc.value;
                         return (
@@ -1722,7 +1850,7 @@ function TeacherApp({
                             type="button"
                             aria-pressed={active}
                             onClick={() => setDraft({ ...draft, scores: { ...draft.scores, [item.id]: sc.value } })}
-                            className={`border-2 py-2 text-center transition-colors ${
+                            className={`border-2 py-3 xl:py-2 text-center transition-colors ${
                               active ? 'bg-neutral-900 border-neutral-900 text-white' : 'border-neutral-300 text-neutral-600 hover:border-neutral-900'
                             }`}
                           >
@@ -1773,7 +1901,7 @@ function TeacherApp({
             value={draft.comment}
             onChange={(e) => setDraft({ ...draft, comment: e.target.value })}
             placeholder={rubric.commentPlaceholder}
-            className="w-full h-40 border-2 border-neutral-300 p-4 text-sm leading-relaxed focus:outline-none focus:border-neutral-900"
+            className="w-full h-40 border-2 border-neutral-300 p-4 text-base md:text-sm leading-relaxed focus:outline-none focus:border-neutral-900"
           />
         </section>
 
@@ -1785,7 +1913,7 @@ function TeacherApp({
             type="button"
             onClick={handleSaveDraft}
             disabled={saving}
-            className="shrink-0 flex items-center justify-center gap-2 bg-neutral-900 text-white text-sm font-bold px-8 py-3 hover:bg-neutral-700 transition-colors disabled:opacity-60"
+            className="w-full sm:w-auto shrink-0 flex items-center justify-center gap-2 bg-neutral-900 text-white text-sm font-bold px-8 py-3 hover:bg-neutral-700 transition-colors disabled:opacity-60"
           >
             {saving ? <Loader2 size={16} className="animate-spin" /> : <ClipboardCheck size={16} />}
             {saving ? '저장하는 중...' : '평가 저장'}
@@ -1853,9 +1981,9 @@ function TeacherApp({
 
         <section>
           <h3 className="text-lg font-bold border-b-4 border-neutral-900 pb-2 mb-1">평가 기록 ({s.evaluations.length}건)</h3>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
+          <div className="lg:overflow-x-auto">
+            <table className="w-full text-sm block lg:table">
+              <thead className="hidden lg:table-header-group">
                 <tr className="border-b-2 border-neutral-900 text-left">
                   <th className="py-3 pr-4 font-bold">평가일</th>
                   <th className="py-3 pr-4 font-bold">구분</th>
@@ -1865,15 +1993,15 @@ function TeacherApp({
                   <th className="py-3 w-10" />
                 </tr>
               </thead>
-              <tbody className="divide-y divide-neutral-200">
+              <tbody className="block lg:table-row-group divide-y divide-neutral-200">
                 {newestFirst.map((row) => {
                   const rubric = RUBRICS[row.kind];
                   return (
-                    <tr key={row.id} className="align-top">
-                      <td className="py-4 pr-4 tabular-nums whitespace-nowrap">{row.evaluated_at}</td>
-                      <td className="py-4 pr-4 whitespace-nowrap font-semibold">{rubric.label}</td>
-                      <td className="py-4 pr-4 text-right font-black tabular-nums">{overallRate(row)}%</td>
-                      <td className="py-4 pr-4">
+                    <tr key={row.id} className="relative block lg:table-row align-top py-4 lg:py-0">
+                      <td className="inline lg:table-cell lg:py-4 pr-2 lg:pr-4 tabular-nums whitespace-nowrap text-xs lg:text-sm text-neutral-500 lg:text-neutral-900">{row.evaluated_at}</td>
+                      <td className="inline lg:table-cell lg:py-4 pr-2 lg:pr-4 whitespace-nowrap font-semibold text-xs lg:text-sm">{rubric.label}</td>
+                      <td className="block lg:table-cell lg:py-4 lg:pr-4 lg:text-right font-black tabular-nums text-2xl lg:text-sm mt-1 lg:mt-0">{overallRate(row)}%</td>
+                      <td className="block lg:table-cell lg:py-4 lg:pr-4 mt-2 lg:mt-0">
                         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-neutral-600">
                           {rubric.domains.map((d) => (
                             <span key={d.key} className="whitespace-nowrap">
@@ -1881,11 +2009,15 @@ function TeacherApp({
                             </span>
                           ))}
                         </div>
-                        {row.evaluator && <p className="text-xs text-neutral-500 mt-2">평가자: {row.evaluator}</p>}
+                        {(sourceLabel(row) || row.evaluator) && (
+                          <p className="text-xs text-neutral-500 mt-2">
+                            {[sourceLabel(row), row.evaluator ? `평가자 ${row.evaluator}` : ''].filter(Boolean).join(' · ')}
+                          </p>
+                        )}
                         {row.comment && <p className="text-xs text-neutral-500 mt-2 line-clamp-2 whitespace-pre-line">{row.comment}</p>}
                       </td>
-                      <td className="py-4 pr-4 whitespace-nowrap">{row.kind === 'self' ? '-' : optionLabel(row.kind, row.summary)}</td>
-                      <td className="py-4">
+                      <td className="block lg:table-cell lg:py-4 lg:pr-4 whitespace-nowrap text-xs lg:text-sm font-semibold lg:font-normal mt-2 lg:mt-0">{row.kind === 'self' ? '-' : optionLabel(row.kind, row.summary)}</td>
+                      <td className="absolute top-3 right-0 lg:static lg:table-cell lg:py-4">
                         <button
                           type="button"
                           aria-label="이 평가 삭제"
@@ -1945,13 +2077,13 @@ function TeacherApp({
     const cell = (n: number | null) => (n === null ? '-' : `${n}%`);
 
     return (
-      <article className="max-w-[210mm] mx-auto bg-white border-2 border-neutral-900 p-10 print:max-w-none print:border-0 print:p-0 text-neutral-900">
-        <header className="flex justify-between items-end border-b-4 border-neutral-900 pb-4">
+      <article className="max-w-[210mm] mx-auto bg-white border-2 border-neutral-900 p-4 sm:p-6 lg:p-10 print:max-w-none print:border-0 print:p-0 text-neutral-900">
+        <header className="flex flex-col sm:flex-row sm:justify-between sm:items-end gap-3 border-b-4 border-neutral-900 pb-4">
           <div>
             <p className="text-xs text-neutral-500">3자 통합 직무 역량 인사이트 (고용주 · 교사 · 학생)</p>
-            <h1 className="text-3xl font-black tracking-tight mt-1">{s.name}</h1>
+            <h1 className="text-2xl sm:text-3xl font-black tracking-tight mt-1">{s.name}</h1>
           </div>
-          <dl className="text-xs text-right space-y-0.5">
+          <dl className="text-xs sm:text-right space-y-0.5">
             {(
               [
                 ['학년', s.grade],
@@ -1968,11 +2100,15 @@ function TeacherApp({
           </dl>
         </header>
 
-        <section className="grid grid-cols-3 border-b-2 border-neutral-900">
+        <section className="grid grid-cols-1 lg:grid-cols-3 print:grid-cols-3 border-b-2 border-neutral-900">
           {KINDS.map((k, i) => {
             const row = latest[k];
             return (
-              <div key={k} className={`py-4 ${i === 0 ? 'pr-4' : 'px-4 border-l-2 border-neutral-900'}`}>
+              <div key={k} className={`py-3 lg:py-4 print:py-4 ${
+                  i === 0
+                    ? 'lg:pr-4 print:pr-4'
+                    : 'border-t border-neutral-200 lg:border-t-0 print:border-t-0 lg:px-4 print:px-4 lg:border-l-2 print:border-l-2 lg:border-neutral-900 print:border-neutral-900'
+                }`}>
                 <p className="text-xs text-neutral-500">
                   최신 {RUBRICS[k].label} {row ? `· ${row.evaluated_at}` : ''}
                 </p>
@@ -1983,6 +2119,7 @@ function TeacherApp({
                       {k === 'self' ? `${RUBRICS.self.max}점 척도 자기평가` : optionLabel(k, row.summary)}
                       {k === 'ojt' && performance !== null ? ` · 직무 성과 ${performance}%` : ''}
                     </p>
+                    {k === 'ojt' && sourceLabel(row) && <p className="text-[11px] text-neutral-500 mt-0.5">{sourceLabel(row)}</p>}
                   </>
                 ) : (
                   <p className="text-sm text-neutral-400 mt-3">평가 기록 없음</p>
@@ -1992,12 +2129,12 @@ function TeacherApp({
           })}
         </section>
 
-        <section className="grid grid-cols-[300px_1fr] gap-6 py-5 border-b-2 border-neutral-900 break-inside-avoid">
-          <div className="flex flex-col items-center">
+        <section className="grid grid-cols-1 lg:grid-cols-[280px_1fr] print:grid-cols-[280px_1fr] gap-6 py-5 border-b-2 border-neutral-900 break-inside-avoid">
+          <div className="flex flex-col items-center overflow-hidden">
             {present.length === 0 ? (
-              <div className="w-[300px] h-[250px] flex items-center justify-center text-xs text-neutral-400">평가 기록이 없습니다.</div>
+              <div className="w-[280px] h-[240px] flex items-center justify-center text-xs text-neutral-400">평가 기록이 없습니다.</div>
             ) : (
-              <RadarChart width={300} height={250} data={radarData} outerRadius={88}>
+              <RadarChart width={280} height={240} data={radarData} outerRadius={80}>
                 <PolarGrid stroke="#d4d4d4" />
                 <PolarAngleAxis dataKey="axis" tick={{ fill: '#171717', fontSize: 10, fontWeight: 600 }} />
                 <PolarRadiusAxis domain={[0, 100]} tickCount={5} tick={{ fill: '#a3a3a3', fontSize: 8 }} axisLine={false} />
@@ -2055,7 +2192,7 @@ function TeacherApp({
           </div>
         </section>
 
-        <section className="grid grid-cols-3 gap-5 py-5 border-b-2 border-neutral-900 break-inside-avoid">
+        <section className="grid grid-cols-1 lg:grid-cols-3 print:grid-cols-3 gap-5 py-5 border-b-2 border-neutral-900 break-inside-avoid">
           {(
             [
               ['ojt', '고용주 의견'],
@@ -2072,7 +2209,7 @@ function TeacherApp({
           ))}
         </section>
 
-        <footer className="grid grid-cols-3 gap-8 pt-8 text-xs">
+        <footer className="grid grid-cols-3 gap-3 sm:gap-8 pt-8 text-xs">
           {['학생', '담당 교사', '실습처 담당자'].map((who) => (
             <div key={who} className="flex justify-between border-t-2 border-neutral-900 pt-2">
               <span className="font-semibold">{who}</span>
@@ -2120,27 +2257,37 @@ function TeacherApp({
     const tabs: { key: Tab; label: string; icon: ReactNode }[] = [
       { key: 'new', label: '새 평가 입력', icon: <ClipboardCheck size={16} /> },
       { key: 'history', label: '평가 히스토리', icon: <History size={16} /> },
-      { key: 'insight', label: '통합 인사이트 (1-Page)', icon: <FileText size={16} /> },
+      { key: 'insight', label: '통합 인사이트', icon: <FileText size={16} /> },
     ];
     return (
       <>
-        <div className="flex flex-wrap justify-between items-end gap-3 border-b-2 border-neutral-900 mb-8 print:hidden">
-          <div className="flex flex-wrap">
+        <div className="md:hidden flex items-center justify-between gap-3 mb-3 print:hidden">
+          <button type="button" onClick={() => setMobilePane('list')} className="flex items-center gap-1 text-sm font-bold py-2 pr-3 -ml-1">
+            <ChevronLeft size={18} /> 학생 목록
+          </button>
+          <p className="text-sm text-right min-w-0 truncate">
+            <span className="font-bold">{selected.name}</span>
+            <span className="text-neutral-500"> · {selected.grade}</span>
+          </p>
+        </div>
+        <div className="flex flex-col-reverse lg:flex-row lg:justify-between lg:items-end gap-2 lg:gap-3 border-b-2 border-neutral-900 mb-6 md:mb-8 print:hidden">
+          <div className="flex overflow-x-auto -mx-4 px-4 md:mx-0 md:px-0">
             {tabs.map((t) => (
               <button
                 key={t.key}
                 type="button"
                 onClick={() => setTab(t.key)}
-                className={`flex items-center gap-2 px-5 py-3 text-sm font-bold border-b-4 -mb-0.5 transition-colors ${
+                className={`flex items-center gap-2 px-3 sm:px-5 py-3 text-sm font-bold border-b-4 -mb-0.5 whitespace-nowrap shrink-0 transition-colors ${
                   tab === t.key ? 'border-neutral-900 text-neutral-900' : 'border-transparent text-neutral-400 hover:text-neutral-900'
                 }`}
               >
                 {t.icon} {t.label}
+                {t.key === 'insight' && <span className="hidden sm:inline">(1-Page)</span>}
               </button>
             ))}
           </div>
-          <div className="flex flex-wrap items-center gap-3 pb-3">
-            <p className="text-sm">
+          <div className="flex flex-wrap items-center gap-2 lg:gap-3 lg:pb-3">
+            <p className="hidden md:block text-sm">
               <span className="font-bold">{selected.name}</span>
               <span className="text-neutral-500">
                 {' '}
@@ -2153,7 +2300,7 @@ function TeacherApp({
               <button
                 type="button"
                 onClick={() => window.print()}
-                className="flex items-center gap-2 border-2 border-neutral-900 px-4 py-2 text-sm font-bold hover:bg-neutral-900 hover:text-white transition-colors"
+                className="flex items-center gap-2 border-2 border-neutral-900 px-3 py-1.5 sm:px-4 sm:py-2 text-sm font-bold hover:bg-neutral-900 hover:text-white transition-colors"
               >
                 <Printer size={16} /> 인쇄
               </button>
@@ -2171,7 +2318,7 @@ function TeacherApp({
 
   // ── 평가 링크 공유 화면 ──
   const renderShare = () => (
-    <main className="p-8 print:hidden">
+    <main className="p-4 md:p-8 print:hidden">
       <div className="max-w-5xl">
         <h2 className="text-lg font-bold border-b-4 border-neutral-900 pb-2">평가 링크 공유</h2>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-5 text-sm text-neutral-600 leading-relaxed">
@@ -2205,8 +2352,8 @@ function TeacherApp({
             {filteredStudents.length === 0 && (
               <p className="text-sm text-neutral-500 py-4">'{studentQuery.trim()}'에 해당하는 학생이 없습니다.</p>
             )}
-            <table className="w-full text-sm">
-              <thead>
+            <table className="w-full text-sm block md:table">
+              <thead className="hidden md:table-header-group">
                 <tr className="border-b-2 border-neutral-900 text-left">
                   <th className="py-3 pr-4 font-bold">학생</th>
                   <th className="py-3 pr-4 font-bold">사장님 평가 링크</th>
@@ -2214,12 +2361,13 @@ function TeacherApp({
                   <th className="py-3 font-bold w-24" />
                 </tr>
               </thead>
-              <tbody className="divide-y divide-neutral-200">
+              <tbody className="block md:table-row-group divide-y divide-neutral-200">
                 {filteredStudents.map((s) => {
                   const lastOjt = latestOf(s.evaluations, 'ojt');
                   const lastSelf = latestOf(s.evaluations, 'self');
                   const linkCell = (kind: LinkKind, last: EvaluationRow | null) => (
-                    <td className="py-4 pr-4">
+                    <td className="block md:table-cell py-2 md:py-4 md:pr-4">
+                      <p className="md:hidden text-xs font-bold mb-1.5">{kind === 'ojt' ? '사장님 평가 링크' : '학생 자기평가 링크'}</p>
                       <div className="flex items-center gap-3">
                         {copyButton(s, kind, true)}
                         <a
@@ -2237,8 +2385,8 @@ function TeacherApp({
                     </td>
                   );
                   return (
-                    <tr key={s.id} className="align-top">
-                      <td className="py-4 pr-4">
+                    <tr key={s.id} className="block md:table-row align-top py-3 md:py-0">
+                      <td className="block md:table-cell pb-1 md:py-4 md:pr-4">
                         <span className="font-bold">{s.name}</span>
                         <span className="text-neutral-500"> · {s.grade}</span>
                         <span className="block text-xs text-neutral-500 mt-0.5">
@@ -2248,7 +2396,7 @@ function TeacherApp({
                       </td>
                       {linkCell('ojt', lastOjt)}
                       {linkCell('self', lastSelf)}
-                      <td className="py-4">
+                      <td className="block md:table-cell py-2 md:py-4">
                         <button
                           type="button"
                           onClick={() => regenerateLinks(s)}
@@ -2275,7 +2423,7 @@ function TeacherApp({
   const pendingCount = members.filter((m) => m.role === 'pending').length;
 
   const renderMembers = () => (
-    <main className="p-8 print:hidden">
+    <main className="p-4 md:p-8 print:hidden">
       <div className="max-w-5xl">
         <h2 className="text-lg font-bold border-b-4 border-neutral-900 pb-2 flex justify-between items-end">
           <span>회원 승인</span>
@@ -2292,8 +2440,8 @@ function TeacherApp({
           </p>
         ) : (
           <div className="overflow-x-auto mt-6">
-            <table className="w-full text-sm">
-              <thead>
+            <table className="w-full text-sm block md:table">
+              <thead className="hidden md:table-header-group">
                 <tr className="border-b-2 border-neutral-900 text-left">
                   <th className="py-3 pr-4 font-bold">이름</th>
                   <th className="py-3 pr-4 font-bold">소속 학교</th>
@@ -2303,17 +2451,20 @@ function TeacherApp({
                   <th className="py-3 font-bold w-28" />
                 </tr>
               </thead>
-              <tbody className="divide-y divide-neutral-200">
+              <tbody className="block md:table-row-group divide-y divide-neutral-200">
                 {members.map((m) => (
-                  <tr key={m.id}>
-                    <td className="py-4 pr-4 font-bold">{m.name || '-'}</td>
-                    <td className="py-4 pr-4">{m.school || '-'}</td>
-                    <td className="py-4 pr-4 text-neutral-600">{m.email}</td>
-                    <td className="py-4 pr-4 tabular-nums text-neutral-600">{m.created_at.slice(0, 10)}</td>
-                    <td className="py-4 pr-4">
+                  <tr key={m.id} className="block md:table-row py-3 md:py-0">
+                    <td className="block md:table-cell py-0.5 md:py-4 md:pr-4 font-bold">{m.name || '-'}</td>
+                    <td className="block md:table-cell py-0.5 md:py-4 md:pr-4">{m.school || '-'}</td>
+                    <td className="block md:table-cell py-0.5 md:py-4 md:pr-4 text-neutral-600 break-all">{m.email}</td>
+                    <td className="block md:table-cell py-0.5 md:py-4 md:pr-4 tabular-nums text-neutral-600">
+                      <span className="md:hidden text-xs text-neutral-400">가입일 </span>
+                      {m.created_at.slice(0, 10)}
+                    </td>
+                    <td className="block md:table-cell py-0.5 md:py-4 md:pr-4">
                       <span className={m.role === 'pending' ? 'font-bold' : 'text-neutral-600'}>{ROLE_LABEL[m.role]}</span>
                     </td>
-                    <td className="py-4">
+                    <td className="block md:table-cell pt-2 md:py-4">
                       {m.role === 'pending' && (
                         <button
                           type="button"
@@ -2355,7 +2506,7 @@ function TeacherApp({
     ) : null;
 
   const renderProfile = () => (
-    <main className="p-8 print:hidden">
+    <main className="p-4 md:p-8 print:hidden">
       <div className="max-w-2xl space-y-12">
         <section>
           <h2 className="text-lg font-bold border-b-4 border-neutral-900 pb-2 mb-5">기본 정보</h2>
@@ -2469,6 +2620,16 @@ function TeacherApp({
             </div>
           )}
         </section>
+
+        <section className="md:hidden">
+          <button
+            type="button"
+            onClick={onSignOut}
+            className="w-full flex items-center justify-center gap-2 border-2 border-neutral-900 py-3 text-sm font-bold"
+          >
+            <LogOut size={16} /> 로그아웃
+          </button>
+        </section>
       </div>
     </main>
   );
@@ -2483,17 +2644,19 @@ function TeacherApp({
   return (
     <div className="min-h-screen flex bg-white text-neutral-900 font-sans print:block">
       {renderNav()}
-      <div className="flex-1 min-w-0">
-        <header className="border-b-4 border-neutral-900 px-8 py-5 flex justify-between items-end gap-4 print:hidden">
+      <div className="flex-1 min-w-0 pb-20 md:pb-0 print:pb-0">
+        <header className="border-b-4 border-neutral-900 px-4 py-3 md:px-8 md:py-5 flex justify-between items-end gap-4 print:hidden">
           <div>
-            <h1 className="text-2xl font-black tracking-tighter">Link-路 <span className="font-bold text-neutral-500">나라T 직업교육 Lab</span></h1>
-            <p className="text-sm text-neutral-500 mt-1">{HEADER_DESC[nav]}</p>
+            <h1 className="text-lg md:text-2xl font-black tracking-tighter">
+              Link-路 <span className="hidden sm:inline font-bold text-neutral-500">나라T 직업교육 Lab</span>
+            </h1>
+            <p className="hidden sm:block text-sm text-neutral-500 mt-1">{HEADER_DESC[nav]}</p>
           </div>
           <div className="text-right text-xs">
             <p className="font-bold text-sm">
               {profile.name || profile.email} <span className="font-normal text-neutral-500">{ROLE_LABEL[profile.role]}</span>
             </p>
-            <p className="text-neutral-500 mt-0.5">{profile.school}</p>
+            <p className="hidden sm:block text-neutral-500 mt-0.5">{profile.school}</p>
             <p className="text-[11px] text-neutral-500 mt-1 flex items-center justify-end gap-1.5">
               <span className={`inline-block w-1.5 h-1.5 rounded-full ${liveStatus === 'live' ? 'bg-neutral-900' : 'bg-neutral-300'}`} />
               {liveStatus === 'live' ? '실시간 반영 중' : liveStatus === 'connecting' ? '연결 중' : '연결 끊김 · 새로고침 필요'}
@@ -2501,9 +2664,9 @@ function TeacherApp({
           </div>
         </header>
         {nav === 'dashboard' ? (
-          <div className="grid grid-cols-1 lg:grid-cols-[340px_1fr] print:block">
+          <div className="grid grid-cols-1 md:grid-cols-[280px_1fr] lg:grid-cols-[340px_1fr] print:block">
             {renderSidebar()}
-            <main className="p-8 min-w-0 print:p-0">{renderDetail()}</main>
+            <main className={`p-4 md:p-6 lg:p-8 min-w-0 print:p-0 print:block ${mobilePane === 'list' ? 'hidden md:block' : ''}`}>{renderDetail()}</main>
           </div>
         ) : nav === 'share' ? (
           renderShare()
@@ -2514,8 +2677,10 @@ function TeacherApp({
         )}
       </div>
 
+      {renderBottomNav()}
+
       {arrivals.length > 0 && (
-        <div className="fixed bottom-6 right-6 z-50 w-80 space-y-2 print:hidden" role="status" aria-live="polite">
+        <div className="fixed bottom-20 inset-x-4 md:inset-x-auto md:bottom-6 md:right-6 md:w-80 z-50 space-y-2 print:hidden" role="status" aria-live="polite">
           {arrivals.map((a) => (
             <div key={a.id} className="bg-neutral-900 text-white p-4 shadow-lg">
               <div className="flex justify-between items-start gap-3">
