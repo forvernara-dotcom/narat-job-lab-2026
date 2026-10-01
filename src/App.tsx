@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import { createClient } from '@supabase/supabase-js';
+import type { Session } from '@supabase/supabase-js';
 import {
   RadarChart,
   Radar,
@@ -27,6 +28,9 @@ import {
   Copy,
   Check,
   Loader2,
+  LogOut,
+  RefreshCw,
+  Users,
 } from 'lucide-react';
 
 // ─────────────────────────────────────────────
@@ -39,13 +43,27 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 const STUDENTS_TABLE = 'portfolio_students';
 const EVALUATIONS_TABLE = 'portfolio_evaluations';
-const EVAL_COLUMNS = 'id, student_id, kind, scores, summary, comment, evaluated_at, created_at';
+const PROFILES_TABLE = 'portfolio_profiles';
+const EVAL_COLUMNS = 'id, student_id, kind, scores, summary, comment, evaluator, evaluated_at, created_at';
+const STUDENT_COLUMNS = 'id, name, grade, main_field, site, created_at, self_token, employer_token';
+const PROFILE_COLUMNS = 'id, email, name, school, role, created_at';
 
 // ─────────────────────────────────────────────
 // 1. 타입
 // ─────────────────────────────────────────────
 type Kind = 'ojt' | 'teacher' | 'self';
 type StaffKind = 'ojt' | 'teacher';
+type LinkKind = 'ojt' | 'self';
+type Role = 'pending' | 'teacher' | 'admin';
+
+type Profile = {
+  id: string;
+  email: string;
+  name: string;
+  school: string;
+  role: Role;
+  created_at: string;
+};
 type ScaleOption = { value: number; label: string; desc: string };
 type RubricItem = { id: string; label: string; prompt?: string };
 type Domain = { key: string; title: string; items: RubricItem[] };
@@ -71,6 +89,7 @@ type EvaluationRow = {
   scores: Record<string, number>;
   summary: string | null;
   comment: string;
+  evaluator: string | null; // 링크로 평가한 사장님 성함 (선택)
   evaluated_at: string;
   created_at: string;
 };
@@ -81,6 +100,8 @@ type Student = {
   grade: string;
   mainField: string;
   site: string;
+  selfToken: string; // 학생 자기평가 링크용
+  employerToken: string; // 사장님 평가 링크용
   evaluations: EvaluationRow[];
 };
 
@@ -96,6 +117,8 @@ type StudentRow = {
   main_field: string;
   site: string | null;
   created_at: string;
+  self_token: string;
+  employer_token: string;
   portfolio_evaluations: RawEvaluationRow[] | null;
 };
 
@@ -342,8 +365,8 @@ const today = () => {
   return local.toISOString().slice(0, 10);
 };
 const emptyDraft = (kind: StaffKind): Draft => ({ kind, date: today(), scores: {}, summary: null, comment: '' });
-const selfLink = (studentId: string) =>
-  `${window.location.origin}${window.location.pathname}?view=self&id=${encodeURIComponent(studentId)}`;
+const linkFor = (kind: LinkKind, token: string) =>
+  `${window.location.origin}${window.location.pathname}?view=${kind}&t=${encodeURIComponent(token)}`;
 
 const normalizeEval = (raw: RawEvaluationRow): EvaluationRow => ({
   ...raw,
@@ -358,6 +381,8 @@ const toStudent = (row: StudentRow): Student => ({
   grade: row.grade,
   mainField: row.main_field,
   site: row.site ?? '',
+  selfToken: row.self_token,
+  employerToken: row.employer_token,
   evaluations: (row.portfolio_evaluations ?? []).map(normalizeEval).sort(byTimeAsc),
 });
 
@@ -373,29 +398,39 @@ const inputClass =
   'w-full border-2 border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:border-neutral-900 bg-white';
 
 // ─────────────────────────────────────────────
-// 4. 라우팅: ?view=self&id=학생ID → 학생 자기평가 화면
+// 4. 라우팅
+//   ?view=ojt&t=토큰   → 사장님 OJT 평가 (로그인 없음, 구글폼처럼 링크만)
+//   ?view=self&t=토큰  → 학생 자기평가 (로그인 없음)
+//   그 외              → 교사 로그인 → 관리자 승인을 받은 교사만 대시보드
 // ─────────────────────────────────────────────
 export default function App() {
   const params = new URLSearchParams(window.location.search);
-  const selfId = params.get('view') === 'self' ? params.get('id') : null;
+  const view = params.get('view');
+  const token = params.get('t');
+  const linkKind: LinkKind | null = token && (view === 'ojt' || view === 'self') ? view : null;
   return (
     <>
       <style>{PRINT_CSS}</style>
-      {selfId ? <SelfAssessmentPage studentId={selfId} /> : <TeacherApp />}
+      {linkKind && token ? <LinkEvaluationPage kind={linkKind} token={token} /> : <AuthGate />}
     </>
   );
 }
 
 // ─────────────────────────────────────────────
-// 5. 학생 자기평가 화면 (공유 링크 전용)
+// 5-1. 링크 평가 화면 (사장님 OJT / 학생 자기평가 공용)
 // ─────────────────────────────────────────────
-function SelfAssessmentPage({ studentId }: { studentId: string }) {
-  const rubric = RUBRICS.self;
-  const [studentName, setStudentName] = useState('');
+type LinkContext = { name: string; grade: string | null; main_field: string | null; site: string | null };
+
+function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) {
+  const rubric = RUBRICS[kind];
+  const isSelf = kind === 'self';
+  const [ctx, setCtx] = useState<LinkContext | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [scores, setScores] = useState<Record<string, number>>({});
+  const [summary, setSummary] = useState<string | null>(null);
   const [comment, setComment] = useState('');
+  const [evaluator, setEvaluator] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState('');
   const [done, setDone] = useState(false);
@@ -403,38 +438,51 @@ function SelfAssessmentPage({ studentId }: { studentId: string }) {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const { data, error } = await supabase.from(STUDENTS_TABLE).select('name').eq('id', studentId).maybeSingle();
+      const { data, error } = await supabase.rpc('get_link_context', { p_token: token, p_kind: kind });
       if (cancelled) return;
-      if (error || !data) setLoadError('링크가 올바르지 않습니다. 선생님께 새 링크를 받아 주세요.');
-      else setStudentName((data as { name: string }).name);
+      const row = Array.isArray(data) ? (data[0] as LinkContext | undefined) : undefined;
+      if (error || !row) {
+        setLoadError(
+          isSelf
+            ? '링크가 올바르지 않아요. 선생님께 새 링크를 받아 주세요.'
+            : '유효하지 않은 평가 링크입니다. 담당 선생님께 새 링크를 요청해 주십시오.'
+        );
+      } else {
+        setCtx(row);
+      }
       setLoading(false);
     })();
     return () => {
       cancelled = true;
     };
-  }, [studentId]);
+  }, [token, kind, isSelf]);
 
   const items = allItems(rubric);
   const answered = items.filter((i) => scores[i.id] != null).length;
 
   const handleSubmit = async () => {
-    if (answered < items.length) {
-      setSubmitError(`아직 고르지 않은 질문이 ${items.length - answered}개 있어요.`);
+    const remaining = items.length - answered;
+    if (remaining > 0) {
+      setSubmitError(isSelf ? `아직 고르지 않은 질문이 ${remaining}개 있어요.` : `평가하지 않은 항목이 ${remaining}개 있습니다.`);
+      return;
+    }
+    if (!isSelf && !summary) {
+      setSubmitError(`${rubric.summaryTitle}를 선택해 주십시오.`);
       return;
     }
     setSubmitting(true);
     setSubmitError('');
-    const { error } = await supabase.from(EVALUATIONS_TABLE).insert({
-      student_id: studentId,
-      kind: 'self',
-      scores,
-      summary: null,
-      comment: comment.trim(),
-      evaluated_at: today(),
+    const { error } = await supabase.rpc('submit_link_evaluation', {
+      p_token: token,
+      p_kind: kind,
+      p_scores: scores,
+      p_summary: isSelf ? null : summary,
+      p_comment: comment.trim(),
+      p_evaluator: isSelf ? null : evaluator.trim() || null,
     });
     setSubmitting(false);
     if (error) {
-      setSubmitError('제출하지 못했어요. 잠시 후 다시 눌러 주세요.');
+      setSubmitError(isSelf ? '제출하지 못했어요. 잠시 후 다시 눌러 주세요.' : '제출하지 못했습니다. 잠시 후 다시 시도해 주십시오.');
       return;
     }
     setDone(true);
@@ -456,24 +504,69 @@ function SelfAssessmentPage({ studentId }: { studentId: string }) {
         <Loader2 size={20} className="animate-spin" /> 불러오는 중...
       </p>
     );
-  if (loadError) return shell(<p className="text-lg font-bold border-l-4 border-neutral-900 pl-4">{loadError}</p>);
+  if (loadError || !ctx) return shell(<p className="text-lg font-bold border-l-4 border-neutral-900 pl-4">{loadError}</p>);
   if (done)
     return shell(
       <div className="border-2 border-neutral-900 p-10 text-center space-y-4">
         <Check size={48} className="mx-auto" strokeWidth={3} />
-        <p className="text-2xl font-black">제출했어요</p>
-        <p className="text-lg">{studentName}님, 수고했어요. 선생님이 확인할 거예요.</p>
+        {isSelf ? (
+          <>
+            <p className="text-2xl font-black">제출했어요</p>
+            <p className="text-lg">{ctx.name}님, 수고했어요. 선생님이 확인할 거예요.</p>
+          </>
+        ) : (
+          <>
+            <p className="text-2xl font-black">평가가 제출되었습니다</p>
+            <p className="text-base leading-relaxed">
+              바쁘신 중에 시간 내어 주셔서 감사합니다. 평가 내용은 담당 선생님께 바로 전달됩니다.
+              <br />
+              다음 평가 때도 같은 링크를 사용하시면 됩니다.
+            </p>
+          </>
+        )}
       </div>
     );
+
+  const promptClass = isSelf ? 'text-lg font-semibold mb-4 leading-relaxed' : 'text-base font-semibold mb-3';
 
   return shell(
     <div className="space-y-12">
       <div>
-        <h1 className="text-3xl font-black tracking-tight">{studentName}님의 자기평가</h1>
-        <p className="text-lg text-neutral-600 mt-3 leading-relaxed">
-          요즘 일할 때 나의 모습을 생각하며, 질문마다 하나씩 골라 주세요.
-        </p>
+        {isSelf ? (
+          <>
+            <h1 className="text-3xl font-black tracking-tight">{ctx.name}님의 자기평가</h1>
+            <p className="text-lg text-neutral-600 mt-3 leading-relaxed">요즘 일할 때 나의 모습을 생각하며, 질문마다 하나씩 골라 주세요.</p>
+          </>
+        ) : (
+          <>
+            <p className="text-sm text-neutral-500">현장실습(OJT) 평가</p>
+            <h1 className="text-3xl font-black tracking-tight mt-1">{ctx.name} 학생</h1>
+            <p className="text-sm text-neutral-600 mt-2">
+              {[ctx.site, ctx.main_field, ctx.grade].filter(Boolean).join(' · ')}
+            </p>
+            <p className="text-base text-neutral-700 mt-5 leading-relaxed border-l-4 border-neutral-900 pl-4">
+              학생이 현장에서 보인 모습을 기준으로 항목마다 하나씩 선택해 주십시오. 약 3분이 걸리며, 가입이나 로그인 없이 바로
+              제출됩니다.
+            </p>
+          </>
+        )}
       </div>
+
+      {!isSelf && (
+        <section>
+          <h2 className="text-sm font-bold mb-3">평가 기준</h2>
+          <div className="grid grid-cols-2 gap-0.5 bg-neutral-900 border-2 border-neutral-900">
+            {rubric.scale.map((sc) => (
+              <div key={sc.value} className="bg-white p-4">
+                <p className="text-lg font-black">
+                  {sc.value}점 · {sc.label}
+                </p>
+                <p className="text-xs text-neutral-500 mt-1 leading-relaxed">{sc.desc}</p>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
 
       {rubric.domains.map((domain, di) => (
         <section key={domain.key}>
@@ -482,9 +575,9 @@ function SelfAssessmentPage({ studentId }: { studentId: string }) {
           </h2>
           <div className="divide-y divide-neutral-200">
             {domain.items.map((item) => (
-              <div key={item.id} className="py-6">
-                <p className="text-lg font-semibold mb-4 leading-relaxed">{item.prompt}</p>
-                <div className="grid grid-cols-3 gap-3">
+              <div key={item.id} className={isSelf ? 'py-6' : 'py-5'}>
+                <p className={promptClass}>{item.prompt ?? item.label}</p>
+                <div className={`grid gap-2 ${isSelf ? 'grid-cols-3 gap-3' : 'grid-cols-4'}`}>
                   {rubric.scale.map((sc) => {
                     const active = scores[item.id] === sc.value;
                     return (
@@ -493,12 +586,21 @@ function SelfAssessmentPage({ studentId }: { studentId: string }) {
                         type="button"
                         aria-pressed={active}
                         onClick={() => setScores((prev) => ({ ...prev, [item.id]: sc.value }))}
-                        className={`border-2 py-4 transition-colors ${
+                        className={`border-2 transition-colors ${isSelf ? 'py-4' : 'py-3'} ${
                           active ? 'bg-neutral-900 border-neutral-900 text-white' : 'border-neutral-300 hover:border-neutral-900'
                         }`}
                       >
-                        <span className="block text-xl font-black">{sc.label}</span>
-                        <span className={`block text-sm mt-1 ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>{sc.desc}</span>
+                        {isSelf ? (
+                          <>
+                            <span className="block text-xl font-black">{sc.label}</span>
+                            <span className={`block text-sm mt-1 ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>{sc.desc}</span>
+                          </>
+                        ) : (
+                          <>
+                            <span className="block text-base font-black">{sc.value}</span>
+                            <span className={`block text-xs mt-0.5 ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>{sc.label}</span>
+                          </>
+                        )}
                       </button>
                     );
                   })}
@@ -509,24 +611,69 @@ function SelfAssessmentPage({ studentId }: { studentId: string }) {
         </section>
       ))}
 
+      {!isSelf && (
+        <section>
+          <h2 className="text-xl font-bold border-b-4 border-neutral-900 pb-2 mb-4">{rubric.summaryTitle}</h2>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            {rubric.summaryOptions.map((opt) => {
+              const active = summary === opt.value;
+              return (
+                <label
+                  key={opt.value}
+                  className={`flex items-center gap-3 border-2 px-4 py-3 cursor-pointer text-sm font-semibold transition-colors ${
+                    active ? 'border-neutral-900 bg-neutral-900 text-white' : 'border-neutral-300 hover:border-neutral-900'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="link-summary"
+                    value={opt.value}
+                    checked={active}
+                    onChange={() => setSummary(opt.value)}
+                    className="accent-neutral-900"
+                  />
+                  {opt.label}
+                </label>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
       <section>
-        <label htmlFor="self-comment" className="block text-xl font-bold border-b-4 border-neutral-900 pb-2 mb-4">
-          {rubric.commentTitle}
+        <label htmlFor="link-comment" className="block text-xl font-bold border-b-4 border-neutral-900 pb-2 mb-4">
+          {isSelf ? rubric.commentTitle : '종합 의견 (선택)'}
         </label>
         <textarea
-          id="self-comment"
+          id="link-comment"
           value={comment}
           onChange={(e) => setComment(e.target.value)}
+          maxLength={2000}
           placeholder={rubric.commentPlaceholder}
-          className="w-full h-32 border-2 border-neutral-300 p-4 text-lg focus:outline-none focus:border-neutral-900"
+          className={`w-full h-36 border-2 border-neutral-300 p-4 focus:outline-none focus:border-neutral-900 ${isSelf ? 'text-lg' : 'text-sm leading-relaxed'}`}
         />
+        {!isSelf && (
+          <div className="mt-4">
+            <label htmlFor="link-evaluator" className="block text-sm font-semibold mb-2">
+              평가자 성함 (선택)
+            </label>
+            <input
+              id="link-evaluator"
+              value={evaluator}
+              onChange={(e) => setEvaluator(e.target.value)}
+              maxLength={50}
+              placeholder="예: 홍길동 점장"
+              className={inputClass}
+            />
+          </div>
+        )}
       </section>
 
       <div className="space-y-3">
         <p className="text-base text-neutral-600">
-          {answered} / {items.length}개 골랐어요
+          {answered} / {items.length}개 {isSelf ? '골랐어요' : '항목 평가 완료'}
         </p>
-        {submitError && <p className="text-lg font-bold border-l-4 border-neutral-900 pl-3">{submitError}</p>}
+        {submitError && <p className="text-base font-bold border-l-4 border-neutral-900 pl-3">{submitError}</p>}
         <button
           type="button"
           onClick={handleSubmit}
@@ -534,7 +681,7 @@ function SelfAssessmentPage({ studentId }: { studentId: string }) {
           className="w-full bg-neutral-900 text-white text-xl font-black py-5 flex items-center justify-center gap-2 hover:bg-neutral-700 transition-colors disabled:opacity-60"
         >
           {submitting ? <Loader2 size={22} className="animate-spin" /> : <Check size={22} strokeWidth={3} />}
-          {submitting ? '보내는 중...' : '제출하기'}
+          {submitting ? '보내는 중...' : isSelf ? '제출하기' : '평가 제출하기'}
         </button>
       </div>
     </div>
@@ -542,12 +689,314 @@ function SelfAssessmentPage({ studentId }: { studentId: string }) {
 }
 
 // ─────────────────────────────────────────────
+// 5-2. 로그인 · 가입 · 승인 대기
+// ─────────────────────────────────────────────
+function AuthShell({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="min-h-screen bg-white text-neutral-900 font-sans flex items-center justify-center p-6">
+      <div className="w-full max-w-sm">
+        <p className="text-2xl font-black tracking-tighter">나라T 직업교육lab</p>
+        <p className="text-sm text-neutral-500 mt-1 mb-8">현장실습 직무 역량 평가</p>
+        <div className="border-2 border-neutral-900 p-8">
+          <h1 className="text-lg font-bold border-b-4 border-neutral-900 pb-2 mb-6">{title}</h1>
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const authErrorMessage = (msg: string) => {
+  const m = msg.toLowerCase();
+  if (m.includes('invalid login credentials')) return '이메일 또는 비밀번호가 올바르지 않습니다.';
+  if (m.includes('email not confirmed')) return '이메일 인증이 아직 완료되지 않았습니다. 받은편지함과 스팸함에서 인증 메일을 확인하십시오.';
+  if (m.includes('already registered')) return '이미 가입된 이메일입니다. 로그인하거나 비밀번호를 재설정하십시오.';
+  if (m.includes('rate limit')) return '메일 발송 한도를 초과했습니다. 잠시 후 다시 시도하십시오.';
+  if (m.includes('password')) return `비밀번호 조건을 확인하십시오: ${msg}`;
+  return `처리하지 못했습니다: ${msg}`;
+};
+
+type AuthMode = 'login' | 'signup' | 'reset';
+
+function AuthScreen() {
+  const [mode, setMode] = useState<AuthMode>('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [name, setName] = useState('');
+  const [school, setSchool] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [info, setInfo] = useState('');
+
+  const switchMode = (m: AuthMode) => {
+    setMode(m);
+    setError('');
+    setInfo('');
+  };
+
+  const redirectTo = `${window.location.origin}${window.location.pathname}`;
+
+  const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setError('');
+    setInfo('');
+    const mail = email.trim();
+    if (!mail) return setError('이메일을 입력하십시오.');
+    if (mode === 'signup') {
+      if (!name.trim() || !school.trim()) return setError('이름과 소속 학교를 입력하십시오.');
+      if (password.length < 8) return setError('비밀번호는 8자 이상으로 정하십시오.');
+    }
+    if (mode !== 'reset' && !password) return setError('비밀번호를 입력하십시오.');
+
+    setBusy(true);
+    if (mode === 'login') {
+      const { error: err } = await supabase.auth.signInWithPassword({ email: mail, password });
+      if (err) setError(authErrorMessage(err.message));
+    } else if (mode === 'signup') {
+      const { data, error: err } = await supabase.auth.signUp({
+        email: mail,
+        password,
+        options: { emailRedirectTo: redirectTo, data: { name: name.trim(), school: school.trim() } },
+      });
+      if (err) setError(authErrorMessage(err.message));
+      else if (!data.session)
+        setInfo('인증 메일을 보냈습니다. 메일의 링크를 누르면 가입이 완료되고, 관리자 승인 후 이용할 수 있습니다. 메일이 보이지 않으면 스팸함을 확인하십시오.');
+    } else {
+      const { error: err } = await supabase.auth.resetPasswordForEmail(mail, { redirectTo });
+      if (err) setError(authErrorMessage(err.message));
+      else setInfo('비밀번호 재설정 메일을 보냈습니다. 메일의 링크를 눌러 새 비밀번호를 정하십시오.');
+    }
+    setBusy(false);
+  };
+
+  const title = mode === 'login' ? '교사 로그인' : mode === 'signup' ? '교사 가입 신청' : '비밀번호 재설정';
+
+  return (
+    <AuthShell title={title}>
+      {mode !== 'reset' && (
+        <div className="grid grid-cols-2 border-2 border-neutral-900 mb-6">
+          {(['login', 'signup'] as AuthMode[]).map((m, i) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => switchMode(m)}
+              className={`py-2 text-sm font-bold transition-colors ${i > 0 ? 'border-l-2 border-neutral-900' : ''} ${
+                mode === m ? 'bg-neutral-900 text-white' : 'hover:bg-neutral-100'
+              }`}
+            >
+              {m === 'login' ? '로그인' : '가입 신청'}
+            </button>
+          ))}
+        </div>
+      )}
+      <form onSubmit={handleSubmit} className="space-y-3">
+        {mode === 'signup' && (
+          <>
+            <input className={inputClass} placeholder="이름" value={name} onChange={(e) => setName(e.target.value)} autoComplete="name" />
+            <input className={inputClass} placeholder="소속 학교" value={school} onChange={(e) => setSchool(e.target.value)} />
+          </>
+        )}
+        <input
+          className={inputClass}
+          type="email"
+          placeholder="이메일"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          autoComplete="email"
+        />
+        {mode !== 'reset' && (
+          <input
+            className={inputClass}
+            type="password"
+            placeholder={mode === 'signup' ? '비밀번호 (8자 이상)' : '비밀번호'}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete={mode === 'signup' ? 'new-password' : 'current-password'}
+          />
+        )}
+        {error && <p className="text-xs font-semibold border-l-4 border-neutral-900 pl-2 py-0.5">{error}</p>}
+        {info && <p className="text-xs border-l-4 border-neutral-400 pl-2 py-0.5 text-neutral-700 leading-relaxed">{info}</p>}
+        <button
+          type="submit"
+          disabled={busy}
+          className="w-full flex items-center justify-center gap-2 bg-neutral-900 text-white text-sm font-bold py-3 hover:bg-neutral-700 transition-colors disabled:opacity-60"
+        >
+          {busy && <Loader2 size={16} className="animate-spin" />}
+          {mode === 'login' ? '로그인' : mode === 'signup' ? '가입 신청' : '재설정 메일 보내기'}
+        </button>
+      </form>
+      <div className="mt-5 text-xs text-neutral-500">
+        {mode === 'reset' ? (
+          <button type="button" onClick={() => switchMode('login')} className="underline hover:text-neutral-900">
+            로그인으로 돌아가기
+          </button>
+        ) : mode === 'login' ? (
+          <button type="button" onClick={() => switchMode('reset')} className="underline hover:text-neutral-900">
+            비밀번호를 잊으셨나요?
+          </button>
+        ) : (
+          <p className="leading-relaxed">가입 후 이메일 인증을 마치면 관리자 승인을 거쳐 교사 권한이 부여됩니다.</p>
+        )}
+      </div>
+    </AuthShell>
+  );
+}
+
+function NewPasswordScreen({ onDone }: { onDone: () => void }) {
+  const [password, setPassword] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (password.length < 8) return setError('비밀번호는 8자 이상으로 정하십시오.');
+    if (password !== confirm) return setError('두 비밀번호가 일치하지 않습니다.');
+    setBusy(true);
+    const { error: err } = await supabase.auth.updateUser({ password });
+    setBusy(false);
+    if (err) return setError(authErrorMessage(err.message));
+    onDone();
+  };
+
+  return (
+    <AuthShell title="새 비밀번호 설정">
+      <form onSubmit={handleSubmit} className="space-y-3">
+        <input
+          className={inputClass}
+          type="password"
+          placeholder="새 비밀번호 (8자 이상)"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          autoComplete="new-password"
+        />
+        <input
+          className={inputClass}
+          type="password"
+          placeholder="새 비밀번호 확인"
+          value={confirm}
+          onChange={(e) => setConfirm(e.target.value)}
+          autoComplete="new-password"
+        />
+        {error && <p className="text-xs font-semibold border-l-4 border-neutral-900 pl-2 py-0.5">{error}</p>}
+        <button
+          type="submit"
+          disabled={busy}
+          className="w-full flex items-center justify-center gap-2 bg-neutral-900 text-white text-sm font-bold py-3 hover:bg-neutral-700 transition-colors disabled:opacity-60"
+        >
+          {busy && <Loader2 size={16} className="animate-spin" />}
+          비밀번호 변경
+        </button>
+      </form>
+    </AuthShell>
+  );
+}
+
+function PendingScreen({
+  email,
+  error,
+  onRefresh,
+  onSignOut,
+}: {
+  email: string;
+  error: string;
+  onRefresh: () => void;
+  onSignOut: () => void;
+}) {
+  return (
+    <AuthShell title="승인 대기 중">
+      <p className="text-sm leading-relaxed">
+        <b>{email}</b> 계정으로 가입되었습니다. 관리자가 교사 권한을 승인하면 바로 이용할 수 있습니다.
+      </p>
+      {error && <p className="text-xs font-semibold border-l-4 border-neutral-900 pl-2 py-0.5 mt-4">{error}</p>}
+      <div className="grid grid-cols-2 gap-2 mt-6">
+        <button
+          type="button"
+          onClick={onRefresh}
+          className="flex items-center justify-center gap-2 border-2 border-neutral-900 py-2.5 text-sm font-bold hover:bg-neutral-900 hover:text-white transition-colors"
+        >
+          <RefreshCw size={15} /> 다시 확인
+        </button>
+        <button
+          type="button"
+          onClick={onSignOut}
+          className="flex items-center justify-center gap-2 border-2 border-neutral-300 py-2.5 text-sm font-bold hover:border-neutral-900 transition-colors"
+        >
+          <LogOut size={15} /> 로그아웃
+        </button>
+      </div>
+    </AuthShell>
+  );
+}
+
+function AuthGate() {
+  const [session, setSession] = useState<Session | null>(null);
+  const [ready, setReady] = useState(false);
+  const [recovery, setRecovery] = useState(false);
+  const [profile, setProfile] = useState<Profile | null>(null);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileError, setProfileError] = useState('');
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      setReady(true);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((event, s) => {
+      if (event === 'PASSWORD_RECOVERY') setRecovery(true);
+      setSession(s);
+    });
+    return () => sub.subscription.unsubscribe();
+  }, []);
+
+  const userId = session?.user.id ?? null;
+
+  const loadProfile = useCallback(async () => {
+    if (!userId) {
+      setProfile(null);
+      return;
+    }
+    setProfileLoading(true);
+    setProfileError('');
+    const { data, error } = await supabase.from(PROFILES_TABLE).select(PROFILE_COLUMNS).eq('id', userId).maybeSingle();
+    if (error) setProfileError(`계정 정보를 불러오지 못했습니다: ${error.message}`);
+    setProfile((data as Profile | null) ?? null);
+    setProfileLoading(false);
+  }, [userId]);
+
+  useEffect(() => {
+    loadProfile();
+  }, [loadProfile]);
+
+  const signOut = async () => {
+    await supabase.auth.signOut();
+    setProfile(null);
+  };
+
+  const loadingView = (
+    <div className="min-h-screen flex items-center justify-center text-sm text-neutral-500 gap-2">
+      <Loader2 size={16} className="animate-spin" /> 불러오는 중...
+    </div>
+  );
+
+  if (!ready) return loadingView;
+  if (recovery && session) return <NewPasswordScreen onDone={() => setRecovery(false)} />;
+  if (!session) return <AuthScreen />;
+  if (profileLoading && !profile) return loadingView;
+  if (!profile || (profile.role !== 'teacher' && profile.role !== 'admin')) {
+    return <PendingScreen email={session.user.email ?? ''} error={profileError} onRefresh={loadProfile} onSignOut={signOut} />;
+  }
+  return <TeacherApp profile={profile} onSignOut={signOut} />;
+}
+
+// ─────────────────────────────────────────────
 // 6. 교사용 앱
 // ─────────────────────────────────────────────
-type NavView = 'dashboard' | 'share';
+type NavView = 'dashboard' | 'share' | 'members';
 type Tab = 'new' | 'history' | 'insight';
 
-function TeacherApp() {
+function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () => void }) {
+  const isAdmin = profile.role === 'admin';
   const [students, setStudents] = useState<Student[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
@@ -561,7 +1010,11 @@ function TeacherApp() {
   const [draftError, setDraftError] = useState('');
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState('');
-  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [regenId, setRegenId] = useState<string | null>(null);
+  const [members, setMembers] = useState<Profile[]>([]);
+  const [membersLoading, setMembersLoading] = useState(false);
+  const [membersError, setMembersError] = useState('');
 
   const selected = students.find((s) => s.id === selectedId) ?? null;
 
@@ -570,7 +1023,7 @@ function TeacherApp() {
     setLoadError('');
     const { data, error } = await supabase
       .from(STUDENTS_TABLE)
-      .select(`id, name, grade, main_field, site, created_at, ${EVALUATIONS_TABLE}(${EVAL_COLUMNS})`)
+      .select(`${STUDENT_COLUMNS}, ${EVALUATIONS_TABLE}(${EVAL_COLUMNS})`)
       .order('created_at', { ascending: true });
     if (error) {
       setLoadError(`데이터를 불러오지 못했습니다: ${error.message}`);
@@ -610,7 +1063,7 @@ function TeacherApp() {
     const { data, error } = await supabase
       .from(STUDENTS_TABLE)
       .insert({ name: form.name.trim(), grade: form.grade, main_field: form.mainField.trim(), site: form.site.trim() || null })
-      .select('id, name, grade, main_field, site, created_at')
+      .select(STUDENT_COLUMNS)
       .single();
     setAdding(false);
     if (error || !data) {
@@ -701,16 +1154,67 @@ function TeacherApp() {
     );
   };
 
-  // ── 자기평가 링크 복사 ──
-  const copyLink = async (student: Student) => {
-    const url = selfLink(student.id);
+  // ── 평가 링크 복사 / 재발급 ──
+  const copyLink = async (student: Student, kind: LinkKind) => {
+    const url = linkFor(kind, kind === 'ojt' ? student.employerToken : student.selfToken);
+    const key = `${student.id}:${kind}`;
     try {
       await navigator.clipboard.writeText(url);
-      setCopiedId(student.id);
-      window.setTimeout(() => setCopiedId((id) => (id === student.id ? null : id)), 2000);
+      setCopiedKey(key);
+      window.setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), 2000);
     } catch {
-      window.prompt('아래 링크를 복사해 학생에게 보내 주세요.', url);
+      window.prompt('아래 링크를 복사해 보내 주세요.', url);
     }
+  };
+
+  const regenerateLinks = async (student: Student) => {
+    if (!window.confirm(`${student.name} 학생의 사장님 평가 링크와 자기평가 링크를 새로 만듭니다. 기존 링크는 더 이상 열리지 않습니다. 계속할까요?`)) return;
+    setRegenId(student.id);
+    const { data, error } = await supabase
+      .from(STUDENTS_TABLE)
+      .update({ self_token: crypto.randomUUID(), employer_token: crypto.randomUUID() })
+      .eq('id', student.id)
+      .select('self_token, employer_token')
+      .single();
+    setRegenId(null);
+    if (error || !data) {
+      window.alert(`재발급하지 못했습니다: ${error?.message ?? '알 수 없는 오류'}`);
+      return;
+    }
+    const tokens = data as { self_token: string; employer_token: string };
+    setStudents((prev) =>
+      prev.map((s) => (s.id === student.id ? { ...s, selfToken: tokens.self_token, employerToken: tokens.employer_token } : s))
+    );
+  };
+
+  // ── 회원 승인 (관리자) ──
+  const fetchMembers = useCallback(async () => {
+    if (!isAdmin) return;
+    setMembersLoading(true);
+    setMembersError('');
+    const { data, error } = await supabase.from(PROFILES_TABLE).select(PROFILE_COLUMNS).order('created_at', { ascending: false });
+    if (error) setMembersError(`회원 목록을 불러오지 못했습니다: ${error.message}`);
+    else setMembers((data ?? []) as Profile[]);
+    setMembersLoading(false);
+  }, [isAdmin]);
+
+  useEffect(() => {
+    if (isAdmin && (nav === 'members' || members.length === 0)) fetchMembers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nav, isAdmin, fetchMembers]);
+
+  const changeRole = async (member: Profile, role: Role) => {
+    const msg =
+      role === 'teacher'
+        ? `${member.name || member.email} 선생님에게 교사 권한을 부여할까요?`
+        : `${member.name || member.email} 선생님의 교사 권한을 해제할까요? 해제해도 그 선생님의 학생 데이터는 삭제되지 않습니다.`;
+    if (!window.confirm(msg)) return;
+    const { error } = await supabase.from(PROFILES_TABLE).update({ role }).eq('id', member.id);
+    if (error) {
+      window.alert(`변경하지 못했습니다: ${error.message}`);
+      return;
+    }
+    setMembers((prev) => prev.map((m) => (m.id === member.id ? { ...m, role } : m)));
   };
 
   // ─────────────────────────────────────────
@@ -718,7 +1222,8 @@ function TeacherApp() {
   // ─────────────────────────────────────────
   const navItems: { key: NavView; label: string; icon: ReactNode }[] = [
     { key: 'dashboard', label: '학생 대시보드', icon: <LayoutDashboard size={20} /> },
-    { key: 'share', label: '자기평가 공유', icon: <Share2 size={20} /> },
+    { key: 'share', label: '평가 링크 공유', icon: <Share2 size={20} /> },
+    ...(isAdmin ? [{ key: 'members' as NavView, label: '회원 승인', icon: <Users size={20} /> }] : []),
   ];
 
   const renderNav = () => (
@@ -744,19 +1249,27 @@ function TeacherApp() {
           </button>
         );
       })}
+      <button
+        type="button"
+        onClick={onSignOut}
+        className="mt-auto w-16 py-3 flex flex-col items-center gap-1.5 text-neutral-400 hover:text-white hover:bg-neutral-800 transition-colors"
+      >
+        <LogOut size={20} />
+        <span className="text-[10px] font-bold">로그아웃</span>
+      </button>
     </nav>
   );
 
-  const copyButton = (student: Student, compact = false) => (
+  const copyButton = (student: Student, kind: LinkKind, compact = false) => (
     <button
       type="button"
-      onClick={() => copyLink(student)}
+      onClick={() => copyLink(student, kind)}
       className={`flex items-center gap-2 border-2 border-neutral-900 text-sm font-bold hover:bg-neutral-900 hover:text-white transition-colors ${
         compact ? 'px-3 py-1.5' : 'px-4 py-2'
       }`}
     >
-      {copiedId === student.id ? <Check size={15} /> : <Copy size={15} />}
-      {copiedId === student.id ? '복사됨' : '자기평가 링크'}
+      {copiedKey === `${student.id}:${kind}` ? <Check size={15} /> : <Copy size={15} />}
+      {copiedKey === `${student.id}:${kind}` ? '복사됨' : kind === 'ojt' ? '사장님 평가 링크' : '자기평가 링크'}
     </button>
   );
 
@@ -1102,6 +1615,7 @@ function TeacherApp() {
                             </span>
                           ))}
                         </div>
+                        {row.evaluator && <p className="text-xs text-neutral-500 mt-2">평가자: {row.evaluator}</p>}
                         {row.comment && <p className="text-xs text-neutral-500 mt-2 line-clamp-2 whitespace-pre-line">{row.comment}</p>}
                       </td>
                       <td className="py-4 pr-4 whitespace-nowrap">{row.kind === 'self' ? '-' : optionLabel(row.kind, row.summary)}</td>
@@ -1359,7 +1873,7 @@ function TeacherApp() {
               </button>
             ))}
           </div>
-          <div className="flex items-center gap-3 pb-3">
+          <div className="flex flex-wrap items-center gap-3 pb-3">
             <p className="text-sm">
               <span className="font-bold">{selected.name}</span>
               <span className="text-neutral-500">
@@ -1367,7 +1881,8 @@ function TeacherApp() {
                 · {selected.grade} · {selected.mainField}
               </span>
             </p>
-            {copyButton(selected)}
+            {copyButton(selected, 'ojt')}
+            {copyButton(selected, 'self')}
             {tab === 'insight' && (
               <button
                 type="button"
@@ -1388,15 +1903,21 @@ function TeacherApp() {
     );
   };
 
-  // ── 자기평가 공유 화면 ──
+  // ── 평가 링크 공유 화면 ──
   const renderShare = () => (
     <main className="p-8 print:hidden">
-      <div className="max-w-4xl">
-        <h2 className="text-lg font-bold border-b-4 border-neutral-900 pb-2">학생 자기평가 링크</h2>
-        <p className="text-sm text-neutral-600 mt-4 leading-relaxed">
-          링크를 복사해 학생에게 보내면, 학생은 로그인 없이 3점 척도 자기평가를 제출할 수 있습니다. 제출할 때마다 새 기록으로
-          누적되며 통합 인사이트에 바로 반영됩니다.
-        </p>
+      <div className="max-w-5xl">
+        <h2 className="text-lg font-bold border-b-4 border-neutral-900 pb-2">평가 링크 공유</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-5 text-sm text-neutral-600 leading-relaxed">
+          <p className="border-l-4 border-neutral-900 pl-3">
+            <b className="text-neutral-900">사장님 평가 링크</b>를 문자나 카카오톡으로 보내면, 사장님은 가입이나 로그인 없이
+            구글폼처럼 바로 그 학생의 OJT 평가를 제출할 수 있습니다.
+          </p>
+          <p className="border-l-4 border-neutral-400 pl-3">
+            <b className="text-neutral-900">자기평가 링크</b>는 학생용입니다. 두 링크 모두 제출할 때마다 새 기록으로 쌓이고, 해당
+            학생의 평가 제출 외에는 아무것도 볼 수 없습니다.
+          </p>
+        </div>
         {loading ? (
           <p className="text-sm text-neutral-500 py-8 flex items-center gap-2">
             <Loader2 size={16} className="animate-spin" /> 불러오는 중...
@@ -1404,59 +1925,178 @@ function TeacherApp() {
         ) : students.length === 0 ? (
           <p className="text-sm text-neutral-500 py-8">등록된 학생이 없습니다. 학생 대시보드에서 먼저 학생을 추가하세요.</p>
         ) : (
-          <table className="w-full text-sm mt-6">
-            <thead>
-              <tr className="border-b-2 border-neutral-900 text-left">
-                <th className="py-3 pr-4 font-bold">학생</th>
-                <th className="py-3 pr-4 font-bold">최근 자기평가</th>
-                <th className="py-3 pr-4 font-bold">링크</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-neutral-200">
-              {students.map((s) => {
-                const last = latestOf(s.evaluations, 'self');
-                return (
-                  <tr key={s.id}>
-                    <td className="py-4 pr-4">
-                      <span className="font-bold">{s.name}</span>
-                      <span className="text-neutral-500"> · {s.grade}</span>
-                    </td>
-                    <td className="py-4 pr-4 tabular-nums">{last ? `${last.evaluated_at} · ${overallRate(last)}%` : '미제출'}</td>
+          <div className="overflow-x-auto mt-6">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b-2 border-neutral-900 text-left">
+                  <th className="py-3 pr-4 font-bold">학생</th>
+                  <th className="py-3 pr-4 font-bold">사장님 평가 링크</th>
+                  <th className="py-3 pr-4 font-bold">학생 자기평가 링크</th>
+                  <th className="py-3 font-bold w-24" />
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-neutral-200">
+                {students.map((s) => {
+                  const lastOjt = latestOf(s.evaluations, 'ojt');
+                  const lastSelf = latestOf(s.evaluations, 'self');
+                  const linkCell = (kind: LinkKind, last: EvaluationRow | null) => (
                     <td className="py-4 pr-4">
                       <div className="flex items-center gap-3">
-                        {copyButton(s, true)}
-                        <a href={selfLink(s.id)} target="_blank" rel="noreferrer" className="text-sm underline text-neutral-600 hover:text-neutral-900">
+                        {copyButton(s, kind, true)}
+                        <a
+                          href={linkFor(kind, kind === 'ojt' ? s.employerToken : s.selfToken)}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-sm underline text-neutral-600 hover:text-neutral-900"
+                        >
                           열기
                         </a>
                       </div>
+                      <p className="text-[11px] text-neutral-500 mt-1.5 tabular-nums">
+                        {last ? `최근 제출 ${last.evaluated_at} · ${overallRate(last)}%` : '제출 기록 없음'}
+                      </p>
                     </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+                  );
+                  return (
+                    <tr key={s.id} className="align-top">
+                      <td className="py-4 pr-4">
+                        <span className="font-bold">{s.name}</span>
+                        <span className="text-neutral-500"> · {s.grade}</span>
+                        <span className="block text-xs text-neutral-500 mt-0.5">
+                          {s.mainField}
+                          {s.site ? ` / ${s.site}` : ''}
+                        </span>
+                      </td>
+                      {linkCell('ojt', lastOjt)}
+                      {linkCell('self', lastSelf)}
+                      <td className="py-4">
+                        <button
+                          type="button"
+                          onClick={() => regenerateLinks(s)}
+                          disabled={regenId === s.id}
+                          className="flex items-center gap-1.5 text-xs text-neutral-500 hover:text-neutral-900 disabled:opacity-50"
+                          title="링크가 외부에 잘못 전달되었을 때 기존 링크를 무효화합니다."
+                        >
+                          <RefreshCw size={13} className={regenId === s.id ? 'animate-spin' : ''} /> 재발급
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
     </main>
   );
 
+  // ── 회원 승인 화면 (관리자 전용: 학생 데이터는 보이지 않음) ──
+  const ROLE_LABEL: Record<Role, string> = { pending: '승인 대기', teacher: '교사', admin: '관리자' };
+  const pendingCount = members.filter((m) => m.role === 'pending').length;
+
+  const renderMembers = () => (
+    <main className="p-8 print:hidden">
+      <div className="max-w-5xl">
+        <h2 className="text-lg font-bold border-b-4 border-neutral-900 pb-2 flex justify-between items-end">
+          <span>회원 승인</span>
+          <span className="text-sm font-normal text-neutral-500">승인 대기 {pendingCount}명</span>
+        </h2>
+        <p className="text-sm text-neutral-600 mt-4 leading-relaxed">
+          이메일 인증을 마친 가입자가 표시됩니다. 연구회 선생님이 맞는지 확인한 뒤 승인하세요. 이 화면에서는 각 선생님의 학생
+          정보가 보이지 않습니다.
+        </p>
+        {membersError && <p className="text-sm font-semibold border-l-4 border-neutral-900 pl-3 mt-4">{membersError}</p>}
+        {membersLoading ? (
+          <p className="text-sm text-neutral-500 py-8 flex items-center gap-2">
+            <Loader2 size={16} className="animate-spin" /> 불러오는 중...
+          </p>
+        ) : (
+          <div className="overflow-x-auto mt-6">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b-2 border-neutral-900 text-left">
+                  <th className="py-3 pr-4 font-bold">이름</th>
+                  <th className="py-3 pr-4 font-bold">소속 학교</th>
+                  <th className="py-3 pr-4 font-bold">이메일</th>
+                  <th className="py-3 pr-4 font-bold">가입일</th>
+                  <th className="py-3 pr-4 font-bold">상태</th>
+                  <th className="py-3 font-bold w-28" />
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-neutral-200">
+                {members.map((m) => (
+                  <tr key={m.id}>
+                    <td className="py-4 pr-4 font-bold">{m.name || '-'}</td>
+                    <td className="py-4 pr-4">{m.school || '-'}</td>
+                    <td className="py-4 pr-4 text-neutral-600">{m.email}</td>
+                    <td className="py-4 pr-4 tabular-nums text-neutral-600">{m.created_at.slice(0, 10)}</td>
+                    <td className="py-4 pr-4">
+                      <span className={m.role === 'pending' ? 'font-bold' : 'text-neutral-600'}>{ROLE_LABEL[m.role]}</span>
+                    </td>
+                    <td className="py-4">
+                      {m.role === 'pending' && (
+                        <button
+                          type="button"
+                          onClick={() => changeRole(m, 'teacher')}
+                          className="flex items-center gap-1.5 bg-neutral-900 text-white px-3 py-1.5 text-xs font-bold hover:bg-neutral-700"
+                        >
+                          <Check size={13} /> 승인
+                        </button>
+                      )}
+                      {m.role === 'teacher' && (
+                        <button
+                          type="button"
+                          onClick={() => changeRole(m, 'pending')}
+                          className="border-2 border-neutral-300 px-3 py-1 text-xs font-bold hover:border-neutral-900"
+                        >
+                          권한 해제
+                        </button>
+                      )}
+                      {m.role === 'admin' && <span className="text-xs text-neutral-400">-</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {members.length === 0 && <p className="text-sm text-neutral-500 py-6">가입한 회원이 없습니다.</p>}
+          </div>
+        )}
+      </div>
+    </main>
+  );
+
+  const HEADER_DESC: Record<NavView, string> = {
+    dashboard: '학생 대시보드 · 고용주 · 교사 · 학생 3자 평가 통합 관리',
+    share: '평가 링크 공유 · 사장님 · 학생용 링크 관리',
+    members: '회원 승인 · 연구회 교사 권한 관리',
+  };
+
   return (
     <div className="min-h-screen flex bg-white text-neutral-900 font-sans print:block">
       {renderNav()}
       <div className="flex-1 min-w-0">
-        <header className="border-b-4 border-neutral-900 px-8 py-5 print:hidden">
-          <h1 className="text-2xl font-black tracking-tighter">나라T 직업교육lab</h1>
-          <p className="text-sm text-neutral-500 mt-1">
-            {nav === 'dashboard' ? '학생 대시보드 · 고용주 · 교사 · 학생 3자 평가 통합 관리' : '자기평가 공유 · 학생용 링크 관리'}
-          </p>
+        <header className="border-b-4 border-neutral-900 px-8 py-5 flex justify-between items-end gap-4 print:hidden">
+          <div>
+            <h1 className="text-2xl font-black tracking-tighter">나라T 직업교육lab</h1>
+            <p className="text-sm text-neutral-500 mt-1">{HEADER_DESC[nav]}</p>
+          </div>
+          <div className="text-right text-xs">
+            <p className="font-bold text-sm">
+              {profile.name || profile.email} <span className="font-normal text-neutral-500">{ROLE_LABEL[profile.role]}</span>
+            </p>
+            <p className="text-neutral-500 mt-0.5">{profile.school}</p>
+          </div>
         </header>
         {nav === 'dashboard' ? (
           <div className="grid grid-cols-1 lg:grid-cols-[340px_1fr] print:block">
             {renderSidebar()}
             <main className="p-8 min-w-0 print:p-0">{renderDetail()}</main>
           </div>
-        ) : (
+        ) : nav === 'share' ? (
           renderShare()
+        ) : (
+          renderMembers()
         )}
       </div>
     </div>
