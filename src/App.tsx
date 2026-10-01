@@ -492,7 +492,7 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
   const shell = (children: ReactNode) => (
     <div className="min-h-screen bg-white text-neutral-900 font-sans">
       <header className="border-b-4 border-neutral-900 px-6 py-4">
-        <p className="text-lg font-black tracking-tighter">나라T 직업교육lab</p>
+        <p className="text-lg font-black tracking-tighter">Link-路 <span className="font-bold text-neutral-500">나라T 직업교육 Lab</span></p>
       </header>
       <main className="max-w-2xl mx-auto px-6 py-10">{children}</main>
     </div>
@@ -695,7 +695,7 @@ function AuthShell({ title, children }: { title: string; children: ReactNode }) 
   return (
     <div className="min-h-screen bg-white text-neutral-900 font-sans flex items-center justify-center p-6">
       <div className="w-full max-w-sm">
-        <p className="text-2xl font-black tracking-tighter">나라T 직업교육lab</p>
+        <p className="text-2xl font-black tracking-tighter">Link-路 <span className="font-bold text-neutral-500">나라T 직업교육 Lab</span></p>
         <p className="text-sm text-neutral-500 mt-1 mb-8">현장실습 직무 역량 평가</p>
         <div className="border-2 border-neutral-900 p-8">
           <h1 className="text-lg font-bold border-b-4 border-neutral-900 pb-2 mb-6">{title}</h1>
@@ -1231,7 +1231,7 @@ function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () =>
       aria-label="주요 메뉴"
       className="w-20 shrink-0 bg-neutral-900 text-white flex flex-col items-center py-5 gap-3 sticky top-0 h-screen print:hidden"
     >
-      <div className="w-11 h-11 border-2 border-white flex items-center justify-center font-black text-lg mb-4">T</div>
+      <div className="w-11 h-11 border-2 border-white flex items-center justify-center font-black text-lg mb-4" title="Link-路">路</div>
       {navItems.map((item) => {
         const active = nav === item.key;
         return (
@@ -2078,7 +2078,7 @@ function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () =>
       <div className="flex-1 min-w-0">
         <header className="border-b-4 border-neutral-900 px-8 py-5 flex justify-between items-end gap-4 print:hidden">
           <div>
-            <h1 className="text-2xl font-black tracking-tighter">나라T 직업교육lab</h1>
+            <h1 className="text-2xl font-black tracking-tighter">Link-路 <span className="font-bold text-neutral-500">나라T 직업교육 Lab</span></h1>
             <p className="text-sm text-neutral-500 mt-1">{HEADER_DESC[nav]}</p>
           </div>
           <div className="text-right text-xs">
