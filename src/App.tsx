@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import { createClient } from '@supabase/supabase-js';
 import type { Session } from '@supabase/supabase-js';
@@ -31,6 +31,8 @@ import {
   LogOut,
   RefreshCw,
   Users,
+  UserCog,
+  X,
 } from 'lucide-react';
 
 // ─────────────────────────────────────────────
@@ -55,6 +57,9 @@ type Kind = 'ojt' | 'teacher' | 'self';
 type StaffKind = 'ojt' | 'teacher';
 type LinkKind = 'ojt' | 'self';
 type Role = 'pending' | 'teacher' | 'admin';
+type FormMessage = { type: 'ok' | 'error'; text: string };
+type Arrival = { id: string; studentId: string; studentName: string; kind: Kind; evaluator: string | null; rate: number };
+type LiveStatus = 'connecting' | 'live' | 'offline';
 
 type Profile = {
   id: string;
@@ -986,16 +991,24 @@ function AuthGate() {
   if (!profile || (profile.role !== 'teacher' && profile.role !== 'admin')) {
     return <PendingScreen email={session.user.email ?? ''} error={profileError} onRefresh={loadProfile} onSignOut={signOut} />;
   }
-  return <TeacherApp profile={profile} onSignOut={signOut} />;
+  return <TeacherApp profile={profile} onSignOut={signOut} onProfileUpdated={setProfile} />;
 }
 
 // ─────────────────────────────────────────────
 // 6. 교사용 앱
 // ─────────────────────────────────────────────
-type NavView = 'dashboard' | 'share' | 'members';
+type NavView = 'dashboard' | 'share' | 'members' | 'profile';
 type Tab = 'new' | 'history' | 'insight';
 
-function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () => void }) {
+function TeacherApp({
+  profile,
+  onSignOut,
+  onProfileUpdated,
+}: {
+  profile: Profile;
+  onSignOut: () => void;
+  onProfileUpdated: (p: Profile) => void;
+}) {
   const isAdmin = profile.role === 'admin';
   const [students, setStudents] = useState<Student[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1015,6 +1028,22 @@ function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () =>
   const [members, setMembers] = useState<Profile[]>([]);
   const [membersLoading, setMembersLoading] = useState(false);
   const [membersError, setMembersError] = useState('');
+  const [pfName, setPfName] = useState(profile.name);
+  const [pfSchool, setPfSchool] = useState(profile.school);
+  const [pfSaving, setPfSaving] = useState(false);
+  const [pfMsg, setPfMsg] = useState<FormMessage | null>(null);
+  const [pw, setPw] = useState('');
+  const [pw2, setPw2] = useState('');
+  const [pwBusy, setPwBusy] = useState(false);
+  const [pwMsg, setPwMsg] = useState<FormMessage | null>(null);
+  const [delEmail, setDelEmail] = useState('');
+  const [delBusy, setDelBusy] = useState(false);
+  const [delError, setDelError] = useState('');
+  const [arrivals, setArrivals] = useState<Arrival[]>([]);
+  const [unseen, setUnseen] = useState<Record<string, number>>({});
+  const [liveStatus, setLiveStatus] = useState<LiveStatus>('connecting');
+  const savingKeyRef = useRef<string | null>(null); // 내가 지금 저장 중인 평가 (알림 중복 방지)
+  const studentsRef = useRef<Student[]>([]);
 
   const selected = students.find((s) => s.id === selectedId) ?? null;
 
@@ -1039,6 +1068,59 @@ function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () =>
     fetchStudents();
   }, [fetchStudents]);
 
+  useEffect(() => {
+    studentsRef.current = students;
+  }, [students]);
+
+  // ── 실시간 반영: 사장님·학생이 링크로 제출하면 새로고침 없이 바로 추가 ──
+  useEffect(() => {
+    let wasDisconnected = false;
+    const channel = supabase
+      .channel('portfolio-evaluations-live')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: EVALUATIONS_TABLE }, (payload) => {
+        const row = normalizeEval(payload.new as unknown as RawEvaluationRow);
+        const owner = studentsRef.current.find((st) => st.id === row.student_id);
+        if (!owner || owner.evaluations.some((e) => e.id === row.id)) return;
+        setStudents((prev) =>
+          prev.map((st) =>
+            st.id === row.student_id && !st.evaluations.some((e) => e.id === row.id)
+              ? { ...st, evaluations: [...st.evaluations, row].sort(byTimeAsc) }
+              : st
+          )
+        );
+        if (savingKeyRef.current === `${row.student_id}:${row.kind}`) return; // 내가 방금 저장한 평가는 알림 생략
+        setArrivals((prev) =>
+          [
+            { id: row.id, studentId: owner.id, studentName: owner.name, kind: row.kind, evaluator: row.evaluator, rate: overallRate(row) },
+            ...prev,
+          ].slice(0, 4)
+        );
+        setUnseen((prev) => ({ ...prev, [owner.id]: (prev[owner.id] ?? 0) + 1 }));
+      })
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: EVALUATIONS_TABLE }, (payload) => {
+        const id = (payload.old as { id?: string }).id;
+        if (!id) return;
+        setStudents((prev) =>
+          prev.map((st) => (st.evaluations.some((e) => e.id === id) ? { ...st, evaluations: st.evaluations.filter((e) => e.id !== id) } : st))
+        );
+      })
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          setLiveStatus('live');
+          if (wasDisconnected) fetchStudents(); // 연결이 끊긴 동안 들어온 평가 다시 불러오기
+          wasDisconnected = false;
+        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+          setLiveStatus('offline');
+          wasDisconnected = true;
+        }
+      });
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [fetchStudents]);
+
+  const dismissArrival = (id: string) => setArrivals((prev) => prev.filter((a) => a.id !== id));
+
   const fieldOptions = useMemo(
     () => Array.from(new Set([...FIELD_SUGGESTIONS, ...students.map((s) => s.mainField)])).filter(Boolean),
     [students]
@@ -1046,6 +1128,12 @@ function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () =>
 
   const selectStudent = (id: string) => {
     setSelectedId(id);
+    setUnseen((prev) => {
+      if (!prev[id]) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
     setDraft((d) => emptyDraft(d.kind));
     setDraftError('');
     setNotice('');
@@ -1116,6 +1204,7 @@ function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () =>
     }
     setSaving(true);
     setDraftError('');
+    savingKeyRef.current = `${selected.id}:${draft.kind}`;
     const { data, error } = await supabase
       .from(EVALUATIONS_TABLE)
       .insert({
@@ -1129,13 +1218,20 @@ function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () =>
       .select(EVAL_COLUMNS)
       .single();
     setSaving(false);
+    window.setTimeout(() => {
+      savingKeyRef.current = null;
+    }, 3000);
     if (error || !data) {
       setDraftError(`저장하지 못했습니다: ${error?.message ?? '알 수 없는 오류'}`);
       return;
     }
     const row = normalizeEval(data as unknown as RawEvaluationRow);
     setStudents((prev) =>
-      prev.map((s) => (s.id === selected.id ? { ...s, evaluations: [...s.evaluations, row].sort(byTimeAsc) } : s))
+      prev.map((s) =>
+        s.id === selected.id && !s.evaluations.some((e) => e.id === row.id)
+          ? { ...s, evaluations: [...s.evaluations, row].sort(byTimeAsc) }
+          : s
+      )
     );
     setNotice(`${row.evaluated_at} ${rubric.label} 평가가 저장되었습니다.`);
     setDraft(emptyDraft(draft.kind));
@@ -1203,6 +1299,69 @@ function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () =>
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nav, isAdmin, fetchMembers]);
 
+  // ── 내 정보 ──
+  const saveProfile = async () => {
+    if (!pfName.trim() || !pfSchool.trim()) {
+      setPfMsg({ type: 'error', text: '이름과 소속 학교를 입력하십시오.' });
+      return;
+    }
+    setPfSaving(true);
+    setPfMsg(null);
+    const { data, error } = await supabase
+      .from(PROFILES_TABLE)
+      .update({ name: pfName.trim(), school: pfSchool.trim() })
+      .eq('id', profile.id)
+      .select(PROFILE_COLUMNS)
+      .single();
+    setPfSaving(false);
+    if (error || !data) {
+      setPfMsg({ type: 'error', text: `저장하지 못했습니다: ${error?.message ?? '알 수 없는 오류'}` });
+      return;
+    }
+    onProfileUpdated(data as Profile);
+    setPfMsg({ type: 'ok', text: '저장되었습니다.' });
+  };
+
+  const changePassword = async () => {
+    if (pw.length < 8) {
+      setPwMsg({ type: 'error', text: '비밀번호는 8자 이상으로 정하십시오.' });
+      return;
+    }
+    if (pw !== pw2) {
+      setPwMsg({ type: 'error', text: '두 비밀번호가 일치하지 않습니다.' });
+      return;
+    }
+    setPwBusy(true);
+    setPwMsg(null);
+    const { error } = await supabase.auth.updateUser({ password: pw });
+    setPwBusy(false);
+    if (error) {
+      setPwMsg({ type: 'error', text: authErrorMessage(error.message) });
+      return;
+    }
+    setPw('');
+    setPw2('');
+    setPwMsg({ type: 'ok', text: '비밀번호가 변경되었습니다. 다음 로그인부터 새 비밀번호를 사용하십시오.' });
+  };
+
+  const deleteAccount = async () => {
+    if (delEmail.trim().toLowerCase() !== profile.email.toLowerCase()) {
+      setDelError('이메일이 일치하지 않습니다.');
+      return;
+    }
+    if (!window.confirm(`정말 탈퇴할까요?\n학생 ${students.length}명과 평가 기록이 모두 삭제되며 되돌릴 수 없습니다.`)) return;
+    setDelBusy(true);
+    setDelError('');
+    const { error } = await supabase.rpc('delete_my_portfolio_account');
+    if (error) {
+      setDelBusy(false);
+      setDelError(`탈퇴하지 못했습니다: ${error.message}`);
+      return;
+    }
+    window.alert('탈퇴가 완료되었습니다. 그동안 이용해 주셔서 감사합니다.');
+    onSignOut();
+  };
+
   const changeRole = async (member: Profile, role: Role) => {
     const msg =
       role === 'teacher'
@@ -1224,6 +1383,7 @@ function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () =>
     { key: 'dashboard', label: '학생 대시보드', icon: <LayoutDashboard size={20} /> },
     { key: 'share', label: '평가 링크 공유', icon: <Share2 size={20} /> },
     ...(isAdmin ? [{ key: 'members' as NavView, label: '회원 승인', icon: <Users size={20} /> }] : []),
+    { key: 'profile', label: '내 정보', icon: <UserCog size={20} /> },
   ];
 
   const renderNav = () => (
@@ -1342,6 +1502,15 @@ function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () =>
                     <div className="min-w-0">
                       <p className="font-bold truncate">
                         {s.name} <span className={`text-xs font-normal ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>{s.grade}</span>
+                        {unseen[s.id] ? (
+                          <span
+                            className={`ml-2 px-1.5 py-0.5 text-[10px] font-bold align-middle ${
+                              active ? 'bg-white text-neutral-900' : 'bg-neutral-900 text-white'
+                            }`}
+                          >
+                            새 평가 {unseen[s.id]}
+                          </span>
+                        ) : null}
                       </p>
                       <p className={`text-xs truncate ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>
                         {s.mainField}
@@ -2066,10 +2235,139 @@ function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () =>
     </main>
   );
 
+  // ── 내 정보 화면 (이름·학교 수정 / 비밀번호 변경 / 회원 탈퇴, 이메일은 변경 불가) ──
+  const totalEvaluations = students.reduce((sum, s) => sum + s.evaluations.length, 0);
+  const msgLine = (m: FormMessage | null) =>
+    m ? (
+      <p className={`text-xs border-l-4 pl-2 py-0.5 ${m.type === 'error' ? 'border-neutral-900 font-semibold' : 'border-neutral-400 text-neutral-700'}`}>
+        {m.text}
+      </p>
+    ) : null;
+
+  const renderProfile = () => (
+    <main className="p-8 print:hidden">
+      <div className="max-w-2xl space-y-12">
+        <section>
+          <h2 className="text-lg font-bold border-b-4 border-neutral-900 pb-2 mb-5">기본 정보</h2>
+          <div className="space-y-4">
+            <div>
+              <p className="text-sm font-semibold mb-2">이메일</p>
+              <p className="border-2 border-neutral-200 bg-neutral-50 px-3 py-2 text-sm text-neutral-600">{profile.email}</p>
+              <p className="text-xs text-neutral-500 mt-1.5">
+                이메일은 변경할 수 없습니다. 꼭 바꿔야 한다면 탈퇴 후 새 이메일로 다시 가입해 주세요.
+              </p>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="pf-name" className="block text-sm font-semibold mb-2">
+                  이름
+                </label>
+                <input id="pf-name" className={inputClass} value={pfName} onChange={(e) => setPfName(e.target.value)} />
+              </div>
+              <div>
+                <label htmlFor="pf-school" className="block text-sm font-semibold mb-2">
+                  소속 학교
+                </label>
+                <input id="pf-school" className={inputClass} value={pfSchool} onChange={(e) => setPfSchool(e.target.value)} />
+              </div>
+            </div>
+            {msgLine(pfMsg)}
+            <button
+              type="button"
+              onClick={saveProfile}
+              disabled={pfSaving}
+              className="flex items-center gap-2 bg-neutral-900 text-white text-sm font-bold px-6 py-2.5 hover:bg-neutral-700 transition-colors disabled:opacity-60"
+            >
+              {pfSaving && <Loader2 size={15} className="animate-spin" />} 저장
+            </button>
+          </div>
+        </section>
+
+        <section>
+          <h2 className="text-lg font-bold border-b-4 border-neutral-900 pb-2 mb-5">비밀번호 변경</h2>
+          <div className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <input
+                type="password"
+                className={inputClass}
+                placeholder="새 비밀번호 (8자 이상)"
+                value={pw}
+                onChange={(e) => setPw(e.target.value)}
+                autoComplete="new-password"
+              />
+              <input
+                type="password"
+                className={inputClass}
+                placeholder="새 비밀번호 확인"
+                value={pw2}
+                onChange={(e) => setPw2(e.target.value)}
+                autoComplete="new-password"
+              />
+            </div>
+            {msgLine(pwMsg)}
+            <button
+              type="button"
+              onClick={changePassword}
+              disabled={pwBusy}
+              className="flex items-center gap-2 border-2 border-neutral-900 text-sm font-bold px-6 py-2 hover:bg-neutral-900 hover:text-white transition-colors disabled:opacity-60"
+            >
+              {pwBusy && <Loader2 size={15} className="animate-spin" />} 비밀번호 변경
+            </button>
+          </div>
+        </section>
+
+        <section>
+          <h2 className="text-lg font-bold border-b-4 border-neutral-900 pb-2 mb-5">회원 탈퇴</h2>
+          {isAdmin ? (
+            <p className="text-sm text-neutral-600 leading-relaxed">
+              관리자 계정은 탈퇴할 수 없습니다. 관리자가 없으면 새 회원을 승인할 수 없기 때문입니다.
+            </p>
+          ) : (
+            <div className="space-y-4">
+              <div className="border-2 border-neutral-900 p-5 text-sm leading-relaxed space-y-2">
+                <p>
+                  탈퇴하면 계정과 함께 <b>등록한 학생 {students.length}명, 평가 기록 {totalEvaluations}건</b>이 모두 삭제되며 되돌릴 수
+                  없습니다.
+                </p>
+                <p className="text-neutral-600">
+                  학생을 인계해야 한다면 탈퇴 전에 학생별 [통합 인사이트] 리포트를 인쇄해 두십시오. 발송한 사장님·자기평가 링크도 더
+                  이상 열리지 않습니다.
+                </p>
+              </div>
+              <div>
+                <label htmlFor="del-email" className="block text-sm font-semibold mb-2">
+                  확인을 위해 가입 이메일을 입력하십시오
+                </label>
+                <input
+                  id="del-email"
+                  className={inputClass}
+                  value={delEmail}
+                  onChange={(e) => setDelEmail(e.target.value)}
+                  placeholder={profile.email}
+                  autoComplete="off"
+                />
+              </div>
+              {delError && <p className="text-xs font-semibold border-l-4 border-neutral-900 pl-2 py-0.5">{delError}</p>}
+              <button
+                type="button"
+                onClick={deleteAccount}
+                disabled={delBusy || delEmail.trim().toLowerCase() !== profile.email.toLowerCase()}
+                className="flex items-center gap-2 bg-neutral-900 text-white text-sm font-bold px-6 py-2.5 hover:bg-neutral-700 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+              >
+                {delBusy && <Loader2 size={15} className="animate-spin" />} 회원 탈퇴
+              </button>
+            </div>
+          )}
+        </section>
+      </div>
+    </main>
+  );
+
   const HEADER_DESC: Record<NavView, string> = {
     dashboard: '학생 대시보드 · 고용주 · 교사 · 학생 3자 평가 통합 관리',
     share: '평가 링크 공유 · 사장님 · 학생용 링크 관리',
     members: '회원 승인 · 연구회 교사 권한 관리',
+    profile: '내 정보 · 계정 관리',
   };
 
   return (
@@ -2086,6 +2384,10 @@ function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () =>
               {profile.name || profile.email} <span className="font-normal text-neutral-500">{ROLE_LABEL[profile.role]}</span>
             </p>
             <p className="text-neutral-500 mt-0.5">{profile.school}</p>
+            <p className="text-[11px] text-neutral-500 mt-1 flex items-center justify-end gap-1.5">
+              <span className={`inline-block w-1.5 h-1.5 rounded-full ${liveStatus === 'live' ? 'bg-neutral-900' : 'bg-neutral-300'}`} />
+              {liveStatus === 'live' ? '실시간 반영 중' : liveStatus === 'connecting' ? '연결 중' : '연결 끊김 · 새로고침 필요'}
+            </p>
           </div>
         </header>
         {nav === 'dashboard' ? (
@@ -2095,10 +2397,47 @@ function TeacherApp({ profile, onSignOut }: { profile: Profile; onSignOut: () =>
           </div>
         ) : nav === 'share' ? (
           renderShare()
-        ) : (
+        ) : nav === 'members' ? (
           renderMembers()
+        ) : (
+          renderProfile()
         )}
       </div>
+
+      {arrivals.length > 0 && (
+        <div className="fixed bottom-6 right-6 z-50 w-80 space-y-2 print:hidden" role="status" aria-live="polite">
+          {arrivals.map((a) => (
+            <div key={a.id} className="bg-neutral-900 text-white p-4 shadow-lg">
+              <div className="flex justify-between items-start gap-3">
+                <div className="min-w-0">
+                  <p className="text-[11px] text-neutral-400">새 평가 도착</p>
+                  <p className="text-sm font-bold mt-0.5 truncate">
+                    {a.studentName} · {RUBRICS[a.kind].label}
+                  </p>
+                  <p className="text-xs text-neutral-300 mt-1">
+                    종합 {a.rate}%{a.evaluator ? ` · 평가자 ${a.evaluator}` : ''}
+                  </p>
+                </div>
+                <button type="button" aria-label="알림 닫기" onClick={() => dismissArrival(a.id)} className="text-neutral-400 hover:text-white shrink-0">
+                  <X size={16} />
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setNav('dashboard');
+                  selectStudent(a.studentId);
+                  setTab('history');
+                  dismissArrival(a.id);
+                }}
+                className="mt-3 w-full border border-white py-1.5 text-xs font-bold hover:bg-white hover:text-neutral-900 transition-colors"
+              >
+                기록 보기
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
