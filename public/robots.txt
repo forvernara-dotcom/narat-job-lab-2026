@@ -1,0 +1,6 @@
+# 첫 화면만 검색에 노출하고, 주소 뒤에 ?가 붙는 화면(사장님·학생 링크, 공유 링크, 시연 모드)은 제외합니다.
+User-agent: *
+Allow: /$
+Disallow: /*?
+
+Sitemap: https://naralab.vercel.app/sitemap.xml

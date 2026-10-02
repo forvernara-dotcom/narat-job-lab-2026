@@ -57,6 +57,14 @@ const IS_DEMO = urlParams.get('demo') === '1';
 const DEMO_STORAGE_KEY = 'linkro-demo-db-v1';
 const DEMO_USER_ID = 'demo-teacher';
 const DEMO_SUFFIX = IS_DEMO ? '&demo=1' : '';
+
+// 검색엔진 제외: 사장님·학생 링크, 학생소개서 공유 링크, 시연 모드 화면은 검색 결과에 나오지 않게 함 (학생 이름 노출 방지)
+if (urlParams.get('view') || IS_DEMO) {
+  const robots = document.createElement('meta');
+  robots.name = 'robots';
+  robots.content = 'noindex, nofollow';
+  document.head.appendChild(robots);
+}
 const TRASH_DAYS = 30; // 휴지통 보관 기간
 const supabase = IS_DEMO
   ? (createDemoClient(!['ojt', 'self', 'intro'].includes(urlParams.get('view') ?? '')) as unknown as ReturnType<typeof createClient>)
