@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { FormEvent, ReactNode } from 'react';
+import type { FormEvent, ReactNode, RefObject } from 'react';
+import { toPng } from 'html-to-image';
 import { createClient } from '@supabase/supabase-js';
 import type { Session } from '@supabase/supabase-js';
 import {
@@ -36,6 +37,9 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronLeft,
+  Briefcase,
+  ImageDown,
+  ExternalLink,
   X,
 } from 'lucide-react';
 
@@ -51,8 +55,8 @@ const STUDENTS_TABLE = 'portfolio_students';
 const EVALUATIONS_TABLE = 'portfolio_evaluations';
 const PROFILES_TABLE = 'portfolio_profiles';
 const EVAL_COLUMNS = 'id, student_id, kind, form, scores, summary, comment, evaluator, input_method, evaluated_at, created_at';
-const STUDENT_COLUMNS = 'id, name, grade, main_field, site, created_at, self_token, employer_token';
-const PROFILE_COLUMNS = 'id, email, name, school, role, created_at';
+const STUDENT_COLUMNS = 'id, name, grade, main_field, site, created_at, self_token, employer_token, intro, share_token';
+const PROFILE_COLUMNS = 'id, email, name, school, role, created_at, contact, consent_version, consented_at';
 
 // ─────────────────────────────────────────────
 // 1. 타입
@@ -74,6 +78,9 @@ type Profile = {
   school: string;
   role: Role;
   created_at: string;
+  contact: string | null; // 사장님용 자료에 표시할 연락처 (선택)
+  consent_version: string | null;
+  consented_at: string | null;
 };
 type FormKey = 'ojt_senior' | 'ojt_junior' | 'teacher' | 'self_junior' | 'self_senior';
 type Track = 'junior' | 'senior';
@@ -121,6 +128,8 @@ type Student = {
   site: string;
   selfToken: string; // 학생 자기평가 링크용
   employerToken: string; // 사장님 평가 링크용
+  intro: Intro; // 사장님을 위한 학생소개서
+  shareToken: string | null; // 학생소개서 공유 링크 (null = 공유 안 함)
   evaluations: EvaluationRow[];
 };
 
@@ -138,6 +147,8 @@ type StudentRow = {
   created_at: string;
   self_token: string;
   employer_token: string;
+  intro: unknown;
+  share_token: string | null;
   portfolio_evaluations: RawEvaluationRow[] | null;
 };
 
@@ -892,6 +903,8 @@ const toStudent = (row: StudentRow): Student => ({
   mainField: row.main_field,
   site: row.site ?? '',
   selfToken: row.self_token,
+  intro: parseIntro(row.intro),
+  shareToken: row.share_token ?? null,
   employerToken: row.employer_token,
   evaluations: (row.portfolio_evaluations ?? []).map(normalizeEval).sort(byTimeAsc),
 });
@@ -918,6 +931,14 @@ export default function App() {
   const view = params.get('view');
   const token = params.get('t');
   const linkKind: LinkKind | null = token && (view === 'ojt' || view === 'self') ? view : null;
+  if (view === 'intro' && token) {
+    return (
+      <>
+        <style>{PRINT_CSS}</style>
+        <SharedProfilePage token={token} />
+      </>
+    );
+  }
   return (
     <>
       <style>{PRINT_CSS}</style>
@@ -1316,6 +1337,572 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
 }
 
 // ─────────────────────────────────────────────
+// 5-1b. 사장님용 자료 (학생소개서 카드 · 1-Page 포트폴리오) 공통
+// ─────────────────────────────────────────────
+type Intro = {
+  headline: string; // 한 줄 소개
+  keywords: string[]; // 키워드 3개
+  strength: string; // 이런 점이 강해요
+  tip: string; // 이렇게 알려 주세요
+  support: string; // 이럴 땐 이렇게 도와주세요
+  notes: Record<string, string>; // 영역별 근거 메모 (영역 key → 메모)
+};
+type IntroTextKey = 'strength' | 'tip' | 'support';
+type EvalLite = Pick<EvaluationRow, 'kind' | 'form' | 'scores' | 'summary' | 'evaluated_at'>;
+type ShareData = {
+  name: string;
+  grade: string;
+  mainField: string;
+  site: string;
+  intro: Intro;
+  teacher: { name: string; school: string; contact: string };
+  ojt: EvalLite | null;
+  training: EvalLite | null;
+};
+
+const emptyIntro = (): Intro => ({ headline: '', keywords: ['', '', ''], strength: '', tip: '', support: '', notes: {} });
+
+const parseIntro = (raw: unknown): Intro => {
+  const o = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === 'string' ? v : '');
+  const kw = Array.isArray(o.keywords) ? o.keywords.map(str) : [];
+  const notesRaw = o.notes && typeof o.notes === 'object' ? (o.notes as Record<string, unknown>) : {};
+  return {
+    headline: str(o.headline),
+    keywords: [0, 1, 2].map((i) => kw[i] ?? ''),
+    strength: str(o.strength),
+    tip: str(o.tip),
+    support: str(o.support),
+    notes: Object.fromEntries(Object.entries(notesRaw).map(([k, v]) => [k, str(v)])),
+  };
+};
+
+const INTRO_SECTIONS: { key: IntroTextKey; title: string; hint: string; placeholder: string }[] = [
+  {
+    key: 'strength',
+    title: '이런 점이 강해요',
+    hint: '학생의 가장 큰 강점',
+    placeholder: '예: 한 번 배운 작업은 자리 이탈 없이 끝까지 해냅니다. 단순 반복 업무를 바로 맡기셔도 됩니다.',
+  },
+  {
+    key: 'tip',
+    title: '이렇게 알려 주세요',
+    hint: '업무를 지시할 때 효과적인 방법',
+    placeholder: '예: "이거 하고 저거 해"보다 "1번 박스를 다 접으면, 2번 청소를 시작하세요"처럼 순서를 끊어서 말씀해 주세요.',
+  },
+  {
+    key: 'support',
+    title: '이럴 땐 이렇게 도와주세요',
+    hint: '당황하거나 어려워할 때 대처법',
+    placeholder: '예: 낯선 환경이나 큰 소음에 잠시 멈출 수 있습니다. 다그치기보다 "물 한잔 마시고 5분 뒤에 하자"고 말씀해 주시면 금세 페이스를 찾습니다.',
+  },
+];
+
+// 영역 달성률 → 수준 라벨 (4점 척도 평균 3.5 / 2.5 / 1.5 기준)
+const LEVELS = [
+  { min: 87.5, label: '독립 수행', bars: 4 },
+  { min: 62.5, label: '최소 지원', bars: 3 },
+  { min: 37.5, label: '집중 지원', bars: 2 },
+  { min: 0, label: '수행 어려움', bars: 1 },
+];
+const levelOf = (rate: number) => LEVELS.find((l) => rate >= l.min) ?? LEVELS[LEVELS.length - 1];
+
+const skillRows = (src: EvalLite | null) => {
+  if (!src) return [];
+  const rubric = rubricOf(src);
+  return rubric.domains
+    .map((d) => ({
+      key: d.key,
+      title: d.title.replace(/\s*\(.*\)/, ''),
+      rate: rateOrNull(src.scores, d.items.map((i) => i.id), rubric.max),
+    }))
+    .filter((r): r is { key: string; title: string; rate: number } => r.rate !== null);
+};
+
+const parseShared = (raw: unknown): ShareData | null => {
+  if (!raw || typeof raw !== 'object') return null;
+  const o = raw as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === 'string' ? v : '');
+  const lite = (v: unknown): EvalLite | null => {
+    if (!v || typeof v !== 'object') return null;
+    const e = v as Record<string, unknown>;
+    return {
+      kind: e.kind as Kind,
+      form: (e.form as FormKey | null) ?? null,
+      scores: (e.scores as Record<string, number>) ?? {},
+      summary: (e.summary as string | null) ?? null,
+      evaluated_at: str(e.evaluated_at),
+    };
+  };
+  const t = (o.teacher && typeof o.teacher === 'object' ? o.teacher : {}) as Record<string, unknown>;
+  return {
+    name: str(o.name),
+    grade: str(o.grade),
+    mainField: str(o.main_field),
+    site: str(o.site),
+    intro: parseIntro(o.intro),
+    teacher: { name: str(t.name), school: str(t.school), contact: str(t.contact) },
+    ojt: lite(o.ojt),
+    training: lite(o.training),
+  };
+};
+
+const introLink = (token: string) =>
+  `${window.location.origin}${window.location.pathname}?view=intro&t=${encodeURIComponent(token)}`;
+
+// 이미지 저장: 휴대폰은 공유 창(카카오톡·사진 저장), 컴퓨터는 파일로 내려받기
+const exportImage = async (node: HTMLElement, filename: string) => {
+  const dataUrl = await toPng(node, { pixelRatio: 2, backgroundColor: '#ffffff', cacheBust: true });
+  const isTouch = window.matchMedia('(pointer: coarse)').matches;
+  if (isTouch && navigator.canShare) {
+    const blob = await (await fetch(dataUrl)).blob();
+    const file = new File([blob], filename, { type: 'image/png' });
+    if (navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: filename });
+      return;
+    }
+  }
+  const a = document.createElement('a');
+  a.href = dataUrl;
+  a.download = filename;
+  a.click();
+};
+
+function useImageExport() {
+  const [busy, setBusy] = useState(false);
+  const run = async (node: HTMLElement | null, filename: string) => {
+    if (!node) return;
+    setBusy(true);
+    try {
+      await exportImage(node, filename);
+    } catch (e) {
+      if (!(e instanceof DOMException && e.name === 'AbortError')) window.alert('이미지를 만들지 못했습니다. 잠시 후 다시 시도해 주세요.');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return { busy, run };
+}
+
+// 이미지용 고정 폭 사본 (화면 밖에 그려 두고 이미지로 변환)
+function ExportFrame({ width, nodeRef, children }: { width: number; nodeRef: RefObject<HTMLDivElement | null>; children: ReactNode }) {
+  return (
+    <div aria-hidden="true" style={{ position: 'fixed', left: -10000, top: 0, width, pointerEvents: 'none' }}>
+      <div ref={nodeRef} style={{ width, background: '#ffffff', padding: 24 }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function LevelBar({ bars }: { bars: number }) {
+  return (
+    <span className="flex gap-0.5" aria-hidden="true">
+      {[1, 2, 3, 4].map((i) => (
+        <span key={i} className={`w-4 h-2.5 border border-neutral-900 ${i <= bars ? 'bg-neutral-900' : 'bg-white'}`} />
+      ))}
+    </span>
+  );
+}
+
+function TeacherContactLine({ teacher }: { teacher: ShareData['teacher'] }) {
+  return (
+    <>
+      <b>{teacher.name || '담당 교사'}</b>
+      {teacher.school ? ` · ${teacher.school}` : ''}
+      {teacher.contact ? ` · ${teacher.contact}` : ''}
+    </>
+  );
+}
+
+// 1-Page 포트폴리오 (fixed: 인쇄·이미지용 고정 배치)
+function EmployerPortfolioDoc({ data, fixed = false }: { data: ShareData; fixed?: boolean }) {
+  const source = data.ojt ?? data.training;
+  const rows = skillRows(source);
+  const sourceName = data.ojt ? '사업체 현장 평가' : '교내 직무훈련 평가';
+  const rubric = source ? rubricOf(source) : null;
+  const summary = source && rubric ? rubric.summaryOptions.find((o) => o.value === source.summary) : undefined;
+  const keywords = data.intro.keywords.map((k) => k.trim()).filter(Boolean);
+  const r = (fixedCls: string, responsiveCls: string) => (fixed ? fixedCls : responsiveCls);
+
+  return (
+    <article className={`bg-white text-neutral-900 border-2 border-neutral-900 ${r('p-10', 'p-5 sm:p-10')} print:border-0 print:p-0`}>
+      <header className="border-b-4 border-neutral-900 pb-4">
+        <p className="text-xs text-neutral-500">현장실습 실무 인재 포트폴리오</p>
+        <div className={`flex mt-1 gap-3 ${r('flex-row items-end justify-between', 'flex-col sm:flex-row sm:items-end sm:justify-between')}`}>
+          <div>
+            <h1 className="text-3xl font-black tracking-tight">{data.name}</h1>
+            {data.intro.headline && <p className="text-base font-semibold mt-1">{data.intro.headline}</p>}
+          </div>
+          <dl className={`text-xs space-y-0.5 ${r('text-right', 'sm:text-right')}`}>
+            {(
+              [
+                ['희망 직무', data.mainField],
+                ['실습처', data.site],
+                ['학년', data.grade],
+              ] as [string, string][]
+            )
+              .filter(([, v]) => v)
+              .map(([k, v]) => (
+                <div key={k}>
+                  <dt className="inline text-neutral-500">{k} </dt>
+                  <dd className="inline font-semibold">{v}</dd>
+                </div>
+              ))}
+          </dl>
+        </div>
+        {keywords.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mt-3">
+            {keywords.map((k) => (
+              <span key={k} className="border border-neutral-900 px-2 py-0.5 text-xs font-semibold">
+                #{k.replace(/\s+/g, '_')}
+              </span>
+            ))}
+          </div>
+        )}
+      </header>
+
+      <section className="py-5 border-b-2 border-neutral-900">
+        <div className="flex flex-wrap justify-between items-end gap-2 mb-2">
+          <h2 className="text-sm font-bold">전환 핵심 기술 검증 지수</h2>
+          <p className="text-[11px] text-neutral-500">{source ? `${source.evaluated_at} ${sourceName} 결과` : '평가 기록 없음'}</p>
+        </div>
+        {rows.length === 0 ? (
+          <p className="text-xs text-neutral-500 py-2">아직 평가 기록이 없습니다.</p>
+        ) : (
+          <ul className="divide-y divide-neutral-200">
+            {rows.map((row) => {
+              const lv = levelOf(row.rate);
+              const note = data.intro.notes[row.key]?.trim();
+              return (
+                <li
+                  key={row.key}
+                  className={`py-2.5 grid items-center gap-x-4 gap-y-1 ${r('grid-cols-[170px_auto_1fr]', 'grid-cols-[1fr_auto] sm:grid-cols-[170px_auto_1fr]')}`}
+                >
+                  <span className="text-sm font-semibold">{row.title}</span>
+                  <span className="flex items-center gap-2">
+                    <LevelBar bars={lv.bars} />
+                    <span className="text-xs font-bold whitespace-nowrap">{lv.label}</span>
+                  </span>
+                  <span className={`text-xs text-neutral-600 ${r('', 'col-span-2 sm:col-span-1')}`}>{note}</span>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        {summary && rubric && (
+          <p className="text-xs mt-3 leading-relaxed">
+            <span className="text-neutral-500">{rubric.summaryTitle}: </span>
+            <b>{summary.label}</b>
+            {summary.desc ? ` · ${summary.desc}` : ''}
+          </p>
+        )}
+      </section>
+
+      <section className="py-5 border-b-2 border-neutral-900">
+        <h2 className="text-sm font-bold mb-3">사장님을 위한 학생소개서</h2>
+        <div className={`grid gap-5 ${r('grid-cols-3', 'grid-cols-1 sm:grid-cols-3')}`}>
+          {INTRO_SECTIONS.map((sec) => (
+            <div key={sec.key} className="border-t-4 border-neutral-900 pt-2">
+              <p className="text-xs font-bold">{sec.title}</p>
+              <p className="text-xs leading-relaxed mt-1.5 whitespace-pre-line text-neutral-700">{data.intro[sec.key] || '-'}</p>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <footer className={`pt-4 text-xs flex gap-1 ${r('flex-row justify-between', 'flex-col sm:flex-row sm:justify-between')}`}>
+        <p>
+          <span className="text-neutral-500">현장실습 담당 교사 </span>
+          <TeacherContactLine teacher={data.teacher} />
+        </p>
+        <p className="text-neutral-500">어떤 상황이든 주저하지 마시고 연락 주십시오.</p>
+      </footer>
+    </article>
+  );
+}
+
+// 학생소개서 카드 (카카오톡 이미지 공유용 세로형)
+function StudentIntroCard({ data, fixed = false }: { data: ShareData; fixed?: boolean }) {
+  const rows = skillRows(data.ojt ?? data.training);
+  const keywords = data.intro.keywords.map((k) => k.trim()).filter(Boolean);
+  return (
+    <article className={`bg-white text-neutral-900 border-2 border-neutral-900 mx-auto ${fixed ? 'w-[420px]' : 'w-full max-w-[420px]'}`}>
+      <div className="bg-neutral-900 text-white px-6 py-7">
+        <p className="text-[11px] text-neutral-400">사장님을 위한 학생소개서</p>
+        <h1 className="text-2xl font-black mt-2 leading-snug">{data.intro.headline || `${data.name}입니다`}</h1>
+        <p className="text-sm text-neutral-300 mt-2">
+          {[data.name, data.mainField, data.site].filter(Boolean).join(' · ')}
+        </p>
+        {keywords.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 mt-4">
+            {keywords.map((k) => (
+              <span key={k} className="border border-white px-2 py-0.5 text-xs font-semibold">
+                #{k.replace(/\s+/g, '_')}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+      <div className="px-6 py-5 space-y-4">
+        {INTRO_SECTIONS.map((sec) => (
+          <div key={sec.key}>
+            <p className="text-xs font-bold border-b-2 border-neutral-900 pb-1">{sec.title}</p>
+            <p className="text-sm leading-relaxed mt-2 whitespace-pre-line">{data.intro[sec.key] || '-'}</p>
+          </div>
+        ))}
+        {rows.length > 0 && (
+          <div>
+            <p className="text-xs font-bold border-b-2 border-neutral-900 pb-1">현장 평가 요약</p>
+            <ul className="mt-2 space-y-1.5">
+              {rows.map((row) => {
+                const lv = levelOf(row.rate);
+                return (
+                  <li key={row.key} className="flex items-center justify-between gap-3 text-xs">
+                    <span>{row.title}</span>
+                    <span className="flex items-center gap-2 shrink-0">
+                      <LevelBar bars={lv.bars} />
+                      <b className="w-16 text-right">{lv.label}</b>
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
+      </div>
+      <footer className="border-t-2 border-neutral-900 px-6 py-4 text-xs leading-relaxed">
+        <p className="font-bold">현장실습 담당 교사 · 돌발 상황 연락처</p>
+        <p className="mt-1">
+          <TeacherContactLine teacher={data.teacher} />
+        </p>
+        <p className="text-neutral-500 mt-1">어떤 상황이든 주저하지 마시고 바로 연락 주십시오.</p>
+      </footer>
+    </article>
+  );
+}
+
+function DocViewToggle({ value, onChange }: { value: 'card' | 'portfolio'; onChange: (v: 'card' | 'portfolio') => void }) {
+  return (
+    <div className="grid grid-cols-2 border-2 border-neutral-900 text-xs font-bold">
+      {(
+        [
+          ['card', '학생소개서'],
+          ['portfolio', '1-Page 포트폴리오'],
+        ] as ['card' | 'portfolio', string][]
+      ).map(([k, label], i) => (
+        <button
+          key={k}
+          type="button"
+          aria-pressed={value === k}
+          onClick={() => onChange(k)}
+          className={`px-3 py-2 transition-colors ${i > 0 ? 'border-l-2 border-neutral-900' : ''} ${
+            value === k ? 'bg-neutral-900 text-white' : 'hover:bg-neutral-100'
+          }`}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+const toolButtonClass =
+  'flex items-center gap-2 border-2 border-neutral-900 px-3 py-2 text-sm font-bold hover:bg-neutral-900 hover:text-white transition-colors disabled:opacity-50';
+
+// ─────────────────────────────────────────────
+// 5-1c. 사장님이 받는 공유 페이지 (?view=intro&t=토큰, 로그인 없음)
+// ─────────────────────────────────────────────
+function SharedProfilePage({ token }: { token: string }) {
+  const [data, setData] = useState<ShareData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [view, setView] = useState<'card' | 'portfolio'>('card');
+  const cardRef = useRef<HTMLDivElement>(null);
+  const docRef = useRef<HTMLDivElement>(null);
+  const exporter = useImageExport();
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const { data: res, error } = await supabase.rpc('get_shared_profile', { p_token: token });
+      if (cancelled) return;
+      setData(error ? null : parseShared(res));
+      setLoading(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  if (loading)
+    return (
+      <div className="min-h-screen flex items-center justify-center text-sm text-neutral-500 gap-2">
+        <Loader2 size={16} className="animate-spin" /> 불러오는 중...
+      </div>
+    );
+  if (!data)
+    return (
+      <div className="min-h-screen flex items-center justify-center p-6">
+        <p className="text-base font-bold border-l-4 border-neutral-900 pl-4">공유가 중지되었거나 올바르지 않은 링크입니다. 담당 선생님께 문의해 주십시오.</p>
+      </div>
+    );
+
+  const filename = `${data.name}_${view === 'card' ? '학생소개서' : '포트폴리오'}.png`;
+  return (
+    <div className="min-h-screen bg-white text-neutral-900 font-sans">
+      <header className="border-b-4 border-neutral-900 px-4 py-3 sm:px-6 sm:py-4 print:hidden">
+        <p className="text-lg font-black tracking-tighter">
+          Link-路 <span className="font-bold text-neutral-500">나라T 직업교육 Lab</span>
+        </p>
+      </header>
+      <main className="max-w-4xl mx-auto px-4 py-6 sm:px-6 sm:py-10 print:p-0">
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-6 print:hidden">
+          <DocViewToggle value={view} onChange={setView} />
+          <div className="flex flex-wrap gap-2">
+            <button type="button" onClick={() => window.print()} className={toolButtonClass}>
+              <Printer size={15} /> 인쇄
+            </button>
+            <button
+              type="button"
+              disabled={exporter.busy}
+              onClick={() => exporter.run(view === 'card' ? cardRef.current : docRef.current, filename)}
+              className={toolButtonClass}
+            >
+              {exporter.busy ? <Loader2 size={15} className="animate-spin" /> : <ImageDown size={15} />} 이미지로 저장
+            </button>
+          </div>
+        </div>
+        <div className="print:hidden">{view === 'card' ? <StudentIntroCard data={data} /> : <EmployerPortfolioDoc data={data} />}</div>
+        <div className="hidden print:block">{view === 'card' ? <StudentIntroCard data={data} fixed /> : <EmployerPortfolioDoc data={data} fixed />}</div>
+      </main>
+      <ExportFrame width={468} nodeRef={cardRef}>
+        <StudentIntroCard data={data} fixed />
+      </ExportFrame>
+      <ExportFrame width={842} nodeRef={docRef}>
+        <EmployerPortfolioDoc data={data} fixed />
+      </ExportFrame>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────
+// 5-1d. 개인정보 동의 (가입 시 + 동의 내용이 바뀌면 다시 확인)
+// ─────────────────────────────────────────────
+const CONSENT_VERSION = '2026-10';
+const CONSENT_ITEMS: { key: string; title: string; body: string[] }[] = [
+  {
+    key: 'member',
+    title: '[필수] 회원 개인정보 수집·이용 동의',
+    body: [
+      '수집 항목: 이름, 소속 학교, 이메일 (선택: 연락처)',
+      '이용 목적: 가입 승인과 본인 확인, 서비스 운영 안내, 사장님용 자료에 담당 교사 연락처 표시(연락처를 입력한 경우)',
+      '보유 기간: 회원 탈퇴 시까지 (탈퇴하면 즉시 삭제)',
+      '동의를 거부할 수 있으나, 거부하면 서비스를 이용할 수 없습니다.',
+    ],
+  },
+  {
+    key: 'student',
+    title: '[필수] 학생 정보 관리 책임 확인',
+    body: [
+      '학생 정보와 평가 기록의 관리 책임은 입력한 교사에게 있습니다.',
+      '소속 학교의 개인정보 처리 절차와 보호자 동의 등 필요한 근거를 확인한 뒤 입력합니다.',
+      '평가에 필요한 최소 정보만 입력하며, 장애 유형·진단명·주민등록번호·주소 등은 입력하지 않습니다.',
+      '사장님·학생용 평가 링크와 학생소개서 공유 링크는 필요한 사람에게만 전달하고, 필요 없어지면 중지하거나 재발급합니다.',
+      '탈퇴하면 입력한 학생 정보와 평가 기록이 모두 삭제됩니다.',
+    ],
+  },
+];
+const CONSENT_NOTICE =
+  '관리자는 회원 승인을 위해 이름·소속 학교·이메일만 확인하며, 각 선생님의 학생 정보는 열람할 수 없습니다. 데이터는 Supabase 서버(서울 리전)에 저장됩니다.';
+
+function ConsentChecklist({ agreed, onChange }: { agreed: Record<string, boolean>; onChange: (next: Record<string, boolean>) => void }) {
+  const all = CONSENT_ITEMS.every((c) => agreed[c.key]);
+  return (
+    <div className="space-y-3 text-xs">
+      <label className="flex items-center gap-2 font-bold text-sm border-b-2 border-neutral-900 pb-2">
+        <input
+          type="checkbox"
+          checked={all}
+          onChange={(e) => onChange(Object.fromEntries(CONSENT_ITEMS.map((c) => [c.key, e.target.checked])))}
+          className="accent-neutral-900 w-4 h-4"
+        />
+        모두 동의합니다
+      </label>
+      {CONSENT_ITEMS.map((c) => (
+        <div key={c.key}>
+          <label className="flex items-start gap-2 font-semibold">
+            <input
+              type="checkbox"
+              checked={!!agreed[c.key]}
+              onChange={(e) => onChange({ ...agreed, [c.key]: e.target.checked })}
+              className="accent-neutral-900 w-4 h-4 mt-0.5"
+            />
+            {c.title}
+          </label>
+          <details className="ml-6 mt-1">
+            <summary className="text-neutral-500 underline cursor-pointer">내용 보기</summary>
+            <ul className="mt-1.5 space-y-1 text-neutral-600 leading-relaxed list-disc pl-4">
+              {c.body.map((b) => (
+                <li key={b}>{b}</li>
+              ))}
+            </ul>
+          </details>
+        </div>
+      ))}
+      <p className="text-neutral-500 leading-relaxed">{CONSENT_NOTICE}</p>
+    </div>
+  );
+}
+
+function ConsentScreen({ profile, onAgreed, onSignOut }: { profile: Profile; onAgreed: (p: Profile) => void; onSignOut: () => void }) {
+  const [agreed, setAgreed] = useState<Record<string, boolean>>({});
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  const submit = async () => {
+    if (!CONSENT_ITEMS.every((c) => agreed[c.key])) {
+      setError('필수 항목에 모두 동의해 주십시오.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    const { data, error: err } = await supabase
+      .from(PROFILES_TABLE)
+      .update({ consent_version: CONSENT_VERSION, consented_at: new Date().toISOString() })
+      .eq('id', profile.id)
+      .select(PROFILE_COLUMNS)
+      .single();
+    setBusy(false);
+    if (err || !data) {
+      setError(`저장하지 못했습니다: ${err?.message ?? '알 수 없는 오류'}`);
+      return;
+    }
+    onAgreed(data as Profile);
+  };
+
+  return (
+    <AuthShell title="개인정보 동의">
+      <p className="text-sm leading-relaxed mb-5">
+        학생 정보를 안전하게 다루기 위해 아래 내용에 동의를 받고 있습니다. 동의 내용이 바뀌면 다시 확인을 요청드립니다.
+      </p>
+      <ConsentChecklist agreed={agreed} onChange={setAgreed} />
+      {error && <p className="text-xs font-semibold border-l-4 border-neutral-900 pl-2 py-0.5 mt-4">{error}</p>}
+      <button
+        type="button"
+        onClick={submit}
+        disabled={busy}
+        className="w-full mt-5 flex items-center justify-center gap-2 bg-neutral-900 text-white text-sm font-bold py-3 hover:bg-neutral-700 transition-colors disabled:opacity-60"
+      >
+        {busy && <Loader2 size={16} className="animate-spin" />} 동의하고 계속하기
+      </button>
+      <button type="button" onClick={onSignOut} className="w-full mt-2 text-xs text-neutral-500 underline py-2">
+        동의하지 않고 로그아웃
+      </button>
+    </AuthShell>
+  );
+}
+
+// ─────────────────────────────────────────────
 // 5-2. 로그인 · 가입 · 승인 대기
 // ─────────────────────────────────────────────
 function AuthShell({ title, children }: { title: string; children: ReactNode }) {
@@ -1354,6 +1941,7 @@ function AuthScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
+  const [agreed, setAgreed] = useState<Record<string, boolean>>({});
 
   const switchMode = (m: AuthMode) => {
     setMode(m);
@@ -1372,6 +1960,7 @@ function AuthScreen() {
     if (mode === 'signup') {
       if (!name.trim() || !school.trim()) return setError('이름과 소속 학교를 입력하십시오.');
       if (password.length < 8) return setError('비밀번호는 8자 이상으로 정하십시오.');
+      if (!CONSENT_ITEMS.every((c) => agreed[c.key])) return setError('필수 동의 항목에 모두 체크해 주십시오.');
     }
     if (mode !== 'reset' && !password) return setError('비밀번호를 입력하십시오.');
 
@@ -1383,7 +1972,7 @@ function AuthScreen() {
       const { data, error: err } = await supabase.auth.signUp({
         email: mail,
         password,
-        options: { emailRedirectTo: redirectTo, data: { name: name.trim(), school: school.trim() } },
+        options: { emailRedirectTo: redirectTo, data: { name: name.trim(), school: school.trim(), consent_version: CONSENT_VERSION } },
       });
       if (err) setError(authErrorMessage(err.message));
       else if (!data.session)
@@ -1440,6 +2029,11 @@ function AuthScreen() {
             onChange={(e) => setPassword(e.target.value)}
             autoComplete={mode === 'signup' ? 'new-password' : 'current-password'}
           />
+        )}
+        {mode === 'signup' && (
+          <div className="border-2 border-neutral-200 p-3">
+            <ConsentChecklist agreed={agreed} onChange={setAgreed} />
+          </div>
         )}
         {error && <p className="text-xs font-semibold border-l-4 border-neutral-900 pl-2 py-0.5">{error}</p>}
         {info && <p className="text-xs border-l-4 border-neutral-400 pl-2 py-0.5 text-neutral-700 leading-relaxed">{info}</p>}
@@ -1610,6 +2204,9 @@ function AuthGate() {
   if (recovery && session) return <NewPasswordScreen onDone={() => setRecovery(false)} />;
   if (!session) return <AuthScreen />;
   if (profileLoading && !profile) return loadingView;
+  if (profile && profile.consent_version !== CONSENT_VERSION) {
+    return <ConsentScreen profile={profile} onAgreed={setProfile} onSignOut={signOut} />;
+  }
   if (!profile || (profile.role !== 'teacher' && profile.role !== 'admin')) {
     return <PendingScreen email={session.user.email ?? ''} error={profileError} onRefresh={loadProfile} onSignOut={signOut} />;
   }
@@ -1620,7 +2217,8 @@ function AuthGate() {
 // 6. 교사용 앱
 // ─────────────────────────────────────────────
 type NavView = 'dashboard' | 'share' | 'members' | 'profile';
-type Tab = 'new' | 'history' | 'insight';
+type Tab = 'new' | 'history' | 'insight' | 'employer';
+type PrintTarget = 'insight' | 'portfolio' | 'card';
 
 function TeacherApp({
   profile,
@@ -1652,6 +2250,7 @@ function TeacherApp({
   const [membersError, setMembersError] = useState('');
   const [pfName, setPfName] = useState(profile.name);
   const [pfSchool, setPfSchool] = useState(profile.school);
+  const [pfContact, setPfContact] = useState(profile.contact ?? '');
   const [pfSaving, setPfSaving] = useState(false);
   const [pfMsg, setPfMsg] = useState<FormMessage | null>(null);
   const [pw, setPw] = useState('');
@@ -1675,10 +2274,29 @@ function TeacherApp({
   const [collapsedGrades, setCollapsedGrades] = useState<Record<string, boolean>>({});
   const [mobilePane, setMobilePane] = useState<'list' | 'detail'>('list'); // 휴대폰: 목록 ↔ 상세 전환
   const [showAddForm, setShowAddForm] = useState(false); // 휴대폰: 학생 추가 양식 접기
+  const [printTarget, setPrintTarget] = useState<PrintTarget>('insight');
+  const [docView, setDocView] = useState<'card' | 'portfolio'>('card');
+  const [introDraft, setIntroDraft] = useState<Intro>(emptyIntro());
+  const [introDirty, setIntroDirty] = useState(false);
+  const [introSaving, setIntroSaving] = useState(false);
+  const [introMsg, setIntroMsg] = useState<FormMessage | null>(null);
+  const [shareBusy, setShareBusy] = useState(false);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const docRef = useRef<HTMLDivElement>(null);
+  const exporter = useImageExport();
   const savingKeyRef = useRef<string | null>(null); // 내가 지금 저장 중인 평가 (알림 중복 방지)
   const studentsRef = useRef<Student[]>([]);
 
   const selected = students.find((s) => s.id === selectedId) ?? null;
+
+  // 학생을 바꾸면 학생소개서 작성란을 그 학생의 저장된 내용으로 채움
+  useEffect(() => {
+    const st = students.find((x) => x.id === selectedId);
+    setIntroDraft(st ? st.intro : emptyIntro());
+    setIntroDirty(false);
+    setIntroMsg(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, loading]);
 
   // ── 불러오기 ──
   const fetchStudents = useCallback(async () => {
@@ -1983,7 +2601,7 @@ function TeacherApp({
     setPfMsg(null);
     const { data, error } = await supabase
       .from(PROFILES_TABLE)
-      .update({ name: pfName.trim(), school: pfSchool.trim() })
+      .update({ name: pfName.trim(), school: pfSchool.trim(), contact: pfContact.trim() || null })
       .eq('id', profile.id)
       .select(PROFILE_COLUMNS)
       .single();
@@ -2631,6 +3249,275 @@ function TeacherApp({
     );
   };
 
+  // ── 탭 4: 사장님용 자료 (학생소개서 · 1-Page 포트폴리오) ──
+  const buildShareData = (s: Student, intro: Intro): ShareData => ({
+    name: s.name,
+    grade: s.grade,
+    mainField: s.mainField,
+    site: s.site,
+    intro,
+    teacher: { name: profile.name, school: profile.school, contact: profile.contact ?? '' },
+    ojt: latestOf(s.evaluations, 'ojt'),
+    training: latestOf(s.evaluations, 'teacher'),
+  });
+
+  const doPrint = (target: PrintTarget) => {
+    setPrintTarget(target);
+    window.setTimeout(() => {
+      window.print();
+      setPrintTarget('insight');
+    }, 150);
+  };
+
+  const updateIntro = (patch: Partial<Intro>) => {
+    setIntroDraft((prev) => ({ ...prev, ...patch }));
+    setIntroDirty(true);
+    setIntroMsg(null);
+  };
+
+  const saveIntro = async (s: Student) => {
+    const clean: Intro = {
+      headline: introDraft.headline.trim(),
+      keywords: introDraft.keywords.map((k) => k.trim().replace(/^#/, '')),
+      strength: introDraft.strength.trim(),
+      tip: introDraft.tip.trim(),
+      support: introDraft.support.trim(),
+      notes: Object.fromEntries(Object.entries(introDraft.notes).map(([k, v]) => [k, v.trim()]).filter(([, v]) => v)),
+    };
+    setIntroSaving(true);
+    const { error } = await supabase.from(STUDENTS_TABLE).update({ intro: clean }).eq('id', s.id);
+    setIntroSaving(false);
+    if (error) {
+      setIntroMsg({ type: 'error', text: `저장하지 못했습니다: ${error.message}` });
+      return;
+    }
+    setStudents((prev) => prev.map((st) => (st.id === s.id ? { ...st, intro: clean } : st)));
+    setIntroDraft(clean);
+    setIntroDirty(false);
+    setIntroMsg({ type: 'ok', text: '저장되었습니다. 공유 링크에도 바로 반영됩니다.' });
+  };
+
+  const setShare = async (s: Student, on: boolean) => {
+    if (!on && !window.confirm('공유를 중지하면 이미 보낸 링크가 더 이상 열리지 않습니다. 중지할까요?')) return;
+    setShareBusy(true);
+    const token = on ? crypto.randomUUID() : null;
+    const { error } = await supabase.from(STUDENTS_TABLE).update({ share_token: token }).eq('id', s.id);
+    setShareBusy(false);
+    if (error) {
+      window.alert(`처리하지 못했습니다: ${error.message}`);
+      return;
+    }
+    setStudents((prev) => prev.map((st) => (st.id === s.id ? { ...st, shareToken: token } : st)));
+  };
+
+  const copyIntroLink = async (s: Student) => {
+    if (!s.shareToken) return;
+    const url = introLink(s.shareToken);
+    const key = `${s.id}:intro`;
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopiedKey(key);
+      window.setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), 2000);
+    } catch {
+      window.prompt('아래 링크를 복사해 보내 주세요.', url);
+    }
+  };
+
+  const renderEmployer = (s: Student) => {
+    const preview = buildShareData(s, introDraft);
+    const source = preview.ojt ?? preview.training;
+    const noteDomains = source ? rubricOf(source).domains : [];
+    const lastOjt = latestOf(s.evaluations, 'ojt');
+    const lastSelf = latestOf(s.evaluations, 'self');
+    const filename = `${s.name}_${docView === 'card' ? '학생소개서' : '포트폴리오'}.png`;
+
+    return (
+      <div className="space-y-10 print:hidden">
+        <section className="border-2 border-neutral-900 p-4 sm:p-5">
+          <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-bold">학생소개서 공유 링크</h3>
+              <p className="text-xs text-neutral-600 mt-1 leading-relaxed">
+                링크를 받은 사장님은 로그인 없이 학생소개서와 1-Page 포트폴리오를 보고, 인쇄하거나 이미지로 저장할 수 있습니다. 평가
+                의견과 히스토리는 공개되지 않습니다.
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2 shrink-0">
+              {s.shareToken ? (
+                <>
+                  <button type="button" onClick={() => copyIntroLink(s)} className={toolButtonClass}>
+                    {copiedKey === `${s.id}:intro` ? <Check size={15} /> : <Copy size={15} />}
+                    {copiedKey === `${s.id}:intro` ? '복사됨' : '링크 복사'}
+                  </button>
+                  <a href={introLink(s.shareToken)} target="_blank" rel="noreferrer" className={toolButtonClass}>
+                    <ExternalLink size={15} /> 열기
+                  </a>
+                  <button
+                    type="button"
+                    disabled={shareBusy}
+                    onClick={() => setShare(s, false)}
+                    className="text-xs text-neutral-500 underline px-2 hover:text-neutral-900"
+                  >
+                    공유 중지
+                  </button>
+                </>
+              ) : (
+                <button type="button" disabled={shareBusy} onClick={() => setShare(s, true)} className={toolButtonClass}>
+                  {shareBusy ? <Loader2 size={15} className="animate-spin" /> : <Share2 size={15} />} 공유 링크 만들기
+                </button>
+              )}
+            </div>
+          </div>
+        </section>
+
+        {!profile.contact && (
+          <p className="text-xs border-l-4 border-neutral-400 pl-3 py-0.5 text-neutral-600">
+            [내 정보]에서 연락처를 입력하면 자료 하단에 "돌발 상황 연락처"로 표시됩니다.
+          </p>
+        )}
+
+        <section>
+          <h3 className="text-base sm:text-lg font-bold border-b-4 border-neutral-900 pb-2 mb-5">사장님을 위한 학생소개서 작성</h3>
+          {(lastOjt?.comment || lastSelf?.comment) && (
+            <div className="border-2 border-neutral-200 bg-neutral-50 p-4 mb-6 text-xs leading-relaxed space-y-2">
+              <p className="font-bold">작성 참고</p>
+              {lastOjt?.comment && (
+                <p className="whitespace-pre-line">
+                  <span className="text-neutral-500">최근 사장님 의견 ({lastOjt.evaluated_at}) · </span>
+                  {lastOjt.comment}
+                </p>
+              )}
+              {lastSelf?.comment && (
+                <p className="whitespace-pre-line">
+                  <span className="text-neutral-500">최근 학생 자기평가 ({lastSelf.evaluated_at}) · </span>
+                  {lastSelf.comment}
+                </p>
+              )}
+            </div>
+          )}
+          <div className="space-y-5">
+            <div>
+              <label htmlFor="intro-headline" className="block text-sm font-semibold mb-2">
+                한 줄 소개
+              </label>
+              <input
+                id="intro-headline"
+                className={inputClass}
+                value={introDraft.headline}
+                maxLength={40}
+                onChange={(e) => updateIntro({ headline: e.target.value })}
+                placeholder={`예: 성실한 예비 직원 ${s.name}입니다`}
+              />
+            </div>
+            <div>
+              <p className="text-sm font-semibold mb-2">키워드 (최대 3개)</p>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                {[0, 1, 2].map((i) => (
+                  <input
+                    key={i}
+                    className={inputClass}
+                    value={introDraft.keywords[i] ?? ''}
+                    maxLength={20}
+                    onChange={(e) => {
+                      const next = [...introDraft.keywords];
+                      next[i] = e.target.value;
+                      updateIntro({ keywords: next });
+                    }}
+                    placeholder={['예: 끝까지 해내는 끈기', '예: 밝은 인사', '예: 출퇴근 시간 엄수'][i]}
+                  />
+                ))}
+              </div>
+            </div>
+            {INTRO_SECTIONS.map((sec) => (
+              <div key={sec.key}>
+                <label htmlFor={`intro-${sec.key}`} className="block text-sm font-semibold mb-1">
+                  {sec.title} <span className="font-normal text-neutral-500 text-xs">· {sec.hint}</span>
+                </label>
+                <textarea
+                  id={`intro-${sec.key}`}
+                  value={introDraft[sec.key]}
+                  maxLength={300}
+                  onChange={(e) => updateIntro({ [sec.key]: e.target.value } as Partial<Intro>)}
+                  placeholder={sec.placeholder}
+                  className="w-full h-24 border-2 border-neutral-300 p-3 text-base md:text-sm leading-relaxed focus:outline-none focus:border-neutral-900"
+                />
+              </div>
+            ))}
+            {noteDomains.length > 0 && (
+              <div>
+                <p className="text-sm font-semibold mb-1">
+                  영역별 근거 메모 <span className="font-normal text-neutral-500 text-xs">· 포트폴리오의 수준 라벨 옆에 표시됩니다 (선택)</span>
+                </p>
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-2 mt-2">
+                  {noteDomains.map((d) => (
+                    <label key={d.key} className="block">
+                      <span className="block text-xs text-neutral-600 mb-1">{d.title}</span>
+                      <input
+                        className={inputClass}
+                        value={introDraft.notes[d.key] ?? ''}
+                        maxLength={60}
+                        onChange={(e) => updateIntro({ notes: { ...introDraft.notes, [d.key]: e.target.value } })}
+                        placeholder="예: 지각 0회, 먼저 인사함"
+                      />
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+            {msgLine(introMsg)}
+            <button
+              type="button"
+              onClick={() => saveIntro(s)}
+              disabled={introSaving}
+              className="w-full sm:w-auto flex items-center justify-center gap-2 bg-neutral-900 text-white text-sm font-bold px-8 py-3 hover:bg-neutral-700 transition-colors disabled:opacity-60"
+            >
+              {introSaving && <Loader2 size={15} className="animate-spin" />} 학생소개서 저장
+            </button>
+          </div>
+        </section>
+
+        <section>
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b-4 border-neutral-900 pb-2 mb-4">
+            <h3 className="text-base sm:text-lg font-bold">미리보기</h3>
+            <DocViewToggle value={docView} onChange={setDocView} />
+          </div>
+          <div className="flex flex-wrap gap-2 mb-4">
+            <button type="button" onClick={() => doPrint(docView)} className={toolButtonClass}>
+              <Printer size={15} /> 인쇄
+            </button>
+            <button
+              type="button"
+              disabled={exporter.busy}
+              onClick={() => exporter.run(docView === 'card' ? cardRef.current : docRef.current, filename)}
+              className={toolButtonClass}
+            >
+              {exporter.busy ? <Loader2 size={15} className="animate-spin" /> : <ImageDown size={15} />} 이미지로 저장·공유
+            </button>
+          </div>
+          {introDirty && (
+            <p className="text-xs font-semibold border-l-4 border-neutral-900 pl-2 py-0.5 mb-4">
+              저장하지 않은 내용이 있습니다. 미리보기에는 보이지만, 공유 링크에는 저장한 내용만 보입니다.
+            </p>
+          )}
+          {docView === 'card' ? (
+            <StudentIntroCard data={preview} />
+          ) : (
+            <div className="max-w-[210mm]">
+              <EmployerPortfolioDoc data={preview} />
+            </div>
+          )}
+        </section>
+
+        <ExportFrame width={468} nodeRef={cardRef}>
+          <StudentIntroCard data={preview} fixed />
+        </ExportFrame>
+        <ExportFrame width={842} nodeRef={docRef}>
+          <EmployerPortfolioDoc data={preview} fixed />
+        </ExportFrame>
+      </div>
+    );
+  };
+
   // ── 탭 3: 통합 인사이트 (1-Page) ──
   const renderInsight = (s: Student) => {
     const latest: Record<Kind, EvaluationRow | null> = {
@@ -2854,6 +3741,7 @@ function TeacherApp({
       { key: 'new', label: '새 평가 입력', icon: <ClipboardCheck size={16} /> },
       { key: 'history', label: '평가 히스토리', icon: <History size={16} /> },
       { key: 'insight', label: '통합 인사이트', icon: <FileText size={16} /> },
+      { key: 'employer', label: '사장님용 자료', icon: <Briefcase size={16} /> },
     ];
     return (
       <>
@@ -2895,7 +3783,7 @@ function TeacherApp({
             {tab === 'insight' && (
               <button
                 type="button"
-                onClick={() => window.print()}
+                onClick={() => doPrint('insight')}
                 className="flex items-center gap-2 border-2 border-neutral-900 px-3 py-1.5 sm:px-4 sm:py-2 text-sm font-bold hover:bg-neutral-900 hover:text-white transition-colors"
               >
                 <Printer size={16} /> 인쇄
@@ -2907,7 +3795,20 @@ function TeacherApp({
         {tab === 'new' && renderNewEvaluation(selected)}
         {tab === 'history' && renderHistory(selected)}
         {/* 인사이트: 화면에서는 해당 탭일 때만, 인쇄 시에는 어느 탭에서든 이것만 출력 */}
-        <div className={tab === 'insight' ? 'block' : 'hidden print:block'}>{renderInsight(selected)}</div>
+        {tab === 'employer' && renderEmployer(selected)}
+        <div className={`${tab === 'insight' ? 'block' : 'hidden'} ${printTarget === 'insight' ? 'print:block' : 'print:hidden'}`}>
+          {renderInsight(selected)}
+        </div>
+        {printTarget === 'portfolio' && (
+          <div className="hidden print:block">
+            <EmployerPortfolioDoc data={buildShareData(selected, introDraft)} fixed />
+          </div>
+        )}
+        {printTarget === 'card' && (
+          <div className="hidden print:block">
+            <StudentIntroCard data={buildShareData(selected, introDraft)} fixed />
+          </div>
+        )}
       </>
     );
   };
@@ -3128,6 +4029,25 @@ function TeacherApp({
                 <input id="pf-school" className={inputClass} value={pfSchool} onChange={(e) => setPfSchool(e.target.value)} />
               </div>
             </div>
+            <div>
+              <label htmlFor="pf-contact" className="block text-sm font-semibold mb-2">
+                연락처 <span className="font-normal text-neutral-500 text-xs">(선택)</span>
+              </label>
+              <input
+                id="pf-contact"
+                className={inputClass}
+                value={pfContact}
+                maxLength={40}
+                onChange={(e) => setPfContact(e.target.value)}
+                placeholder="예: 010-1234-5678 또는 학교 교무실 번호"
+              />
+              <p className="text-xs text-neutral-500 mt-1.5">
+                입력하면 사장님께 보내는 학생소개서와 포트폴리오에 "돌발 상황 연락처"로 표시됩니다. 개인 번호 대신 학교 번호를 써도 됩니다.
+              </p>
+            </div>
+            {profile.consented_at && (
+              <p className="text-xs text-neutral-500">개인정보 동의: {profile.consented_at.slice(0, 10)} (버전 {profile.consent_version})</p>
+            )}
             {msgLine(pfMsg)}
             <button
               type="button"
