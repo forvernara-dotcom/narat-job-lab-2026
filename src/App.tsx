@@ -1947,7 +1947,9 @@ const authErrorMessage = (msg: string) => {
   return `처리하지 못했습니다: ${msg}`;
 };
 
-type AuthMode = 'login' | 'signup' | 'reset';
+type AuthMode = 'login' | 'signup' | 'reset' | 'find';
+type FoundEmail = { masked: string; confirmed: boolean };
+const CONTACT_NOTE = '그래도 해결되지 않으면 전북 중등 특수교사 김나라 선생님께 JB메신저로 문의해 주세요.';
 
 function AuthScreen() {
   const [mode, setMode] = useState<AuthMode>('login');
@@ -1959,11 +1961,15 @@ function AuthScreen() {
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
   const [agreed, setAgreed] = useState<Record<string, boolean>>({});
+  const [findName, setFindName] = useState('');
+  const [findSchool, setFindSchool] = useState('');
+  const [found, setFound] = useState<FoundEmail[] | null>(null);
 
   const switchMode = (m: AuthMode) => {
     setMode(m);
     setError('');
     setInfo('');
+    setFound(null);
   };
 
   const redirectTo = `${window.location.origin}${window.location.pathname}`;
@@ -2002,6 +2008,71 @@ function AuthScreen() {
     setBusy(false);
   };
 
+  const findEmail = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    setError('');
+    setFound(null);
+    if (findName.trim().length < 2 || findSchool.trim().length < 2) return setError('가입할 때 입력한 이름과 소속 학교를 입력하십시오.');
+    setBusy(true);
+    const { data, error: err } = await supabase.rpc('find_portfolio_email', { p_name: findName.trim(), p_school: findSchool.trim() });
+    setBusy(false);
+    if (err) return setError(`찾지 못했습니다: ${err.message}`);
+    setFound(Array.isArray(data) ? (data as FoundEmail[]) : []);
+  };
+
+  if (mode === 'find') {
+    return (
+      <AuthShell title="가입한 이메일 찾기">
+        <p className="text-xs text-neutral-600 leading-relaxed mb-4">가입할 때 입력한 이름과 소속 학교를 정확히 입력하면, 가입한 이메일의 일부를 보여 드립니다.</p>
+        <form onSubmit={findEmail} className="space-y-3">
+          <input className={inputClass} placeholder="이름" value={findName} onChange={(e) => setFindName(e.target.value)} autoComplete="name" />
+          <input className={inputClass} placeholder="소속 학교 (예: 나라고등학교)" value={findSchool} onChange={(e) => setFindSchool(e.target.value)} />
+          {error && <p className="text-xs font-semibold border-l-4 border-neutral-900 pl-2 py-0.5">{error}</p>}
+          <button
+            type="submit"
+            disabled={busy}
+            className="w-full flex items-center justify-center gap-2 bg-neutral-900 text-white text-sm font-bold py-3 hover:bg-neutral-700 transition-colors disabled:opacity-60"
+          >
+            {busy && <Loader2 size={16} className="animate-spin" />} 이메일 찾기
+          </button>
+        </form>
+        {found && (
+          <div className="mt-5 border-2 border-neutral-900 p-4 text-sm">
+            {found.length === 0 ? (
+              <p className="text-xs leading-relaxed">
+                일치하는 가입 정보가 없습니다. 이름과 학교를 가입할 때와 똑같이 입력했는지 확인해 주세요. 학교를 옮긴 뒤 [내 정보]에서 학교를 바꾸셨다면 새 학교로 입력합니다.
+              </p>
+            ) : (
+              <>
+                <p className="text-xs text-neutral-500 mb-2">가입한 이메일</p>
+                <ul className="space-y-1">
+                  {found.map((f) => (
+                    <li key={f.masked} className="font-bold tracking-wide">
+                      {f.masked}
+                      {!f.confirmed && <span className="ml-2 text-[11px] font-normal text-neutral-500">(메일 인증 전)</span>}
+                    </li>
+                  ))}
+                </ul>
+                <p className="text-[11px] text-neutral-500 mt-3 leading-relaxed">
+                  이메일이 생각나셨다면 로그인해 주세요. 비밀번호가 기억나지 않으면 [비밀번호 재설정]을 이용하세요.
+                </p>
+              </>
+            )}
+          </div>
+        )}
+        <div className="mt-5 flex flex-wrap gap-x-4 gap-y-2 text-xs text-neutral-500">
+          <button type="button" onClick={() => switchMode('login')} className="underline hover:text-neutral-900">
+            로그인으로 돌아가기
+          </button>
+          <button type="button" onClick={() => switchMode('reset')} className="underline hover:text-neutral-900">
+            비밀번호 재설정
+          </button>
+        </div>
+        <p className="mt-4 text-[11px] text-neutral-400 leading-relaxed">{CONTACT_NOTE}</p>
+      </AuthShell>
+    );
+  }
+
   const title = mode === 'login' ? '교사 로그인' : mode === 'signup' ? '교사 가입 신청' : '비밀번호 재설정';
 
   return (
@@ -2037,6 +2108,11 @@ function AuthScreen() {
           onChange={(e) => setEmail(e.target.value)}
           autoComplete="email"
         />
+        {mode === 'signup' && (
+          <p className="text-[11px] text-neutral-500 leading-relaxed -mt-1">
+            앞으로 계속 쓸 이메일로 가입해 주세요. 이메일은 로그인 아이디가 되며, 가입 후에는 바꿀 수 없습니다.
+          </p>
+        )}
         {mode !== 'reset' && (
           <input
             className={inputClass}
@@ -2069,9 +2145,17 @@ function AuthScreen() {
             로그인으로 돌아가기
           </button>
         ) : mode === 'login' ? (
-          <button type="button" onClick={() => switchMode('reset')} className="underline hover:text-neutral-900">
-            비밀번호를 잊으셨나요?
-          </button>
+          <>
+            <div className="flex flex-wrap gap-x-4 gap-y-2">
+              <button type="button" onClick={() => switchMode('reset')} className="underline hover:text-neutral-900">
+                비밀번호를 잊으셨나요?
+              </button>
+              <button type="button" onClick={() => switchMode('find')} className="underline hover:text-neutral-900">
+                가입한 이메일 찾기
+              </button>
+            </div>
+            <p className="mt-4 text-[11px] text-neutral-400 leading-relaxed">{CONTACT_NOTE}</p>
+          </>
         ) : (
           <p className="leading-relaxed">가입 후 이메일 인증을 마치면 관리자 승인을 거쳐 교사 권한이 부여됩니다.</p>
         )}
