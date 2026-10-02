@@ -67,7 +67,7 @@ const EVALUATIONS_TABLE = 'portfolio_evaluations';
 const PROFILES_TABLE = 'portfolio_profiles';
 const EVAL_COLUMNS = 'id, student_id, kind, form, scores, summary, comment, evaluator, input_method, evaluated_at, created_at';
 const STUDENT_COLUMNS = 'id, name, grade, main_field, site, created_at, self_token, employer_token, intro, share_token, deleted_at';
-const PROFILE_COLUMNS = 'id, email, name, school, role, created_at, contact, consent_version, consented_at';
+const PROFILE_COLUMNS = 'id, email, name, school, role, created_at, contact, consent_version, consented_at, email_confirmed_at';
 
 // ─────────────────────────────────────────────
 // 1. 타입
@@ -92,6 +92,7 @@ type Profile = {
   contact: string | null; // 사장님용 자료에 표시할 연락처 (선택)
   consent_version: string | null;
   consented_at: string | null;
+  email_confirmed_at: string | null; // 메일 인증 완료 시각 (null = 미인증)
 };
 type FormKey = 'ojt_senior' | 'ojt_junior' | 'teacher' | 'self_junior' | 'self_senior';
 type Track = 'junior' | 'senior';
@@ -2709,6 +2710,16 @@ function TeacherApp({
     onSignOut();
   };
 
+  const deleteUnconfirmed = async (member: Profile) => {
+    if (!window.confirm(`${member.email} 가입 신청을 삭제할까요?\n메일 인증을 하지 않은 계정입니다. 이메일을 잘못 입력했다면 올바른 주소로 다시 가입하도록 안내해 주세요.`)) return;
+    const { error } = await supabase.rpc('delete_unconfirmed_member', { p_user: member.id });
+    if (error) {
+      window.alert(`삭제하지 못했습니다: ${error.message}`);
+      return;
+    }
+    setMembers((prev) => prev.filter((m) => m.id !== member.id));
+  };
+
   const changeRole = async (member: Profile, role: Role) => {
     const msg =
       role === 'teacher'
@@ -4028,18 +4039,22 @@ function TeacherApp({
 
   // ── 회원 승인 화면 (관리자 전용: 학생 데이터는 보이지 않음) ──
   const ROLE_LABEL: Record<Role, string> = { pending: '승인 대기', teacher: '교사', admin: '관리자' };
-  const pendingCount = members.filter((m) => m.role === 'pending').length;
+  const pendingCount = members.filter((m) => m.role === 'pending' && m.email_confirmed_at).length;
+  const unconfirmedCount = members.filter((m) => m.role === 'pending' && !m.email_confirmed_at).length;
 
   const renderMembers = () => (
     <main className="p-4 md:p-8 print:hidden">
       <div className="max-w-5xl">
         <h2 className="text-lg font-bold border-b-4 border-neutral-900 pb-2 flex justify-between items-end">
           <span>회원 승인</span>
-          <span className="text-sm font-normal text-neutral-500">승인 대기 {pendingCount}명</span>
+          <span className="text-sm font-normal text-neutral-500">
+            승인 대기 {pendingCount}명{unconfirmedCount > 0 ? ` · 메일 미인증 ${unconfirmedCount}명` : ''}
+          </span>
         </h2>
         <p className="text-sm text-neutral-600 mt-4 leading-relaxed">
-          이메일 인증을 마친 가입자가 표시됩니다. 연구회 선생님이 맞는지 확인한 뒤 승인하세요. 이 화면에서는 각 선생님의 학생
-          정보가 보이지 않습니다.
+          가입 신청한 모든 회원이 표시됩니다. 메일 인증을 마친 회원만 승인할 수 있으며, 연구회 선생님이 맞는지 확인한 뒤
+          승인하세요. 메일 미인증 계정은 이메일을 잘못 입력했을 수 있으니, 본인에게 확인한 뒤 삭제하고 다시 가입하도록 안내해 주세요.
+          이 화면에서는 각 선생님의 학생 정보가 보이지 않습니다.
         </p>
         {membersError && <p className="text-sm font-semibold border-l-4 border-neutral-900 pl-3 mt-4">{membersError}</p>}
         {membersLoading ? (
@@ -4071,9 +4086,14 @@ function TeacherApp({
                     </td>
                     <td className="block md:table-cell py-0.5 md:py-4 md:pr-4">
                       <span className={m.role === 'pending' ? 'font-bold' : 'text-neutral-600'}>{ROLE_LABEL[m.role]}</span>
+                      {m.role === 'pending' && (
+                        <span className={`block text-[11px] mt-0.5 ${m.email_confirmed_at ? 'text-neutral-500' : 'font-bold border-l-2 border-neutral-900 pl-1.5'}`}>
+                          {m.email_confirmed_at ? '메일 인증 완료' : '메일 미인증'}
+                        </span>
+                      )}
                     </td>
                     <td className="block md:table-cell pt-2 md:py-4">
-                      {m.role === 'pending' && (
+                      {m.role === 'pending' && m.email_confirmed_at && (
                         <button
                           type="button"
                           onClick={() => changeRole(m, 'teacher')}
@@ -4081,6 +4101,26 @@ function TeacherApp({
                         >
                           <Check size={13} /> 승인
                         </button>
+                      )}
+                      {m.role === 'pending' && !m.email_confirmed_at && (
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            disabled
+                            title="메일 인증을 마쳐야 승인할 수 있습니다"
+                            className="flex items-center gap-1.5 border-2 border-neutral-200 text-neutral-400 px-3 py-1 text-xs font-bold cursor-not-allowed"
+                          >
+                            <Check size={13} /> 승인
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => deleteUnconfirmed(m)}
+                            aria-label={`${m.email} 가입 신청 삭제`}
+                            className="flex items-center gap-1 text-xs text-neutral-500 hover:text-neutral-900 underline"
+                          >
+                            삭제
+                          </button>
+                        </div>
                       )}
                       {m.role === 'teacher' && (
                         <button
@@ -4837,6 +4877,7 @@ function buildDemoSeed(): DemoDB {
       contact: '010-0000-0000',
       consent_version: CONSENT_VERSION,
       consented_at: '2026-03-01T00:00:00.000Z',
+      email_confirmed_at: '2026-03-01T00:00:00.000Z',
     },
   ];
 
