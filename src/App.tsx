@@ -50,7 +50,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const STUDENTS_TABLE = 'portfolio_students';
 const EVALUATIONS_TABLE = 'portfolio_evaluations';
 const PROFILES_TABLE = 'portfolio_profiles';
-const EVAL_COLUMNS = 'id, student_id, kind, scores, summary, comment, evaluator, input_method, evaluated_at, created_at';
+const EVAL_COLUMNS = 'id, student_id, kind, form, scores, summary, comment, evaluator, input_method, evaluated_at, created_at';
 const STUDENT_COLUMNS = 'id, name, grade, main_field, site, created_at, self_token, employer_token';
 const PROFILE_COLUMNS = 'id, email, name, school, role, created_at';
 
@@ -75,21 +75,27 @@ type Profile = {
   role: Role;
   created_at: string;
 };
+type FormKey = 'ojt_senior' | 'ojt_junior' | 'teacher' | 'self_junior' | 'self_senior';
+type Track = 'junior' | 'senior';
 type ScaleOption = { value: number; label: string; desc: string };
-type RubricItem = { id: string; label: string; prompt?: string };
+type RubricItem = { id: string; label: string; prompt: string; anchors?: string[] }; // anchors: 척도 순서(높은 점수부터) 행동 예시
 type Domain = { key: string; title: string; items: RubricItem[] };
-type Option = { value: string; label: string };
+type Option = { value: string; label: string; desc?: string };
+type ReflectionPrompt = { key: string; label: string; placeholder: string };
 
 type Rubric = {
+  form: FormKey;
   kind: Kind;
   label: string;
   scale: ScaleOption[];
   max: number;
+  allowNA: boolean; // '관찰 기회 없음' 선택지 사용 여부
   domains: Domain[];
   summaryTitle: string;
   summaryOptions: Option[];
   commentTitle: string;
   commentPlaceholder: string;
+  reflections?: ReflectionPrompt[]; // 자기평가 되돌아보기 질문
 };
 
 // 평가 1건 = DB 1행. 학생은 모든 평가 히스토리를 배열로 가짐
@@ -97,7 +103,8 @@ type EvaluationRow = {
   id: string;
   student_id: string;
   kind: Kind;
-  scores: Record<string, number>;
+  form: FormKey | null; // 사용한 양식 (예전 기록은 null → 당시 양식으로 해석)
+  scores: Record<string, number>; // 0 = 관찰 기회 없음
   summary: string | null;
   comment: string;
   evaluator: string | null; // 평가한 사장님 성함
@@ -159,196 +166,658 @@ const sourceLabel = (row: { kind: Kind; input_method: InputMethod | null }) => {
 };
 
 // ─────────────────────────────────────────────
-// 2. 척도 및 루브릭
+// 2. 척도 및 루브릭 (연구회 양식 기준)
+//   · 중학교 ~ 고2 : 저학년 양식 (과정·중재 중심)
+//   · 고3 · 전공과 : 취업 실습 양식 (현장 투입·생산성 중심)
+//   · 교사 평가     : 교내 직무훈련 루브릭 (전 학년 공통)
+//   anchors(행동 예시)는 척도와 같은 순서(높은 점수 → 낮은 점수)로 적습니다.
 // ─────────────────────────────────────────────
-const SCALE4: ScaleOption[] = [
-  { value: 4, label: '독립적 수행', desc: '지시·촉구 없이 스스로 상황에 맞게 행동' },
-  { value: 3, label: '최소 지원', desc: '1~2회의 가벼운 언어적·시각적 촉구가 있으면 수행' },
-  { value: 2, label: '집중 지원', desc: '지속적인 안내와 감독이 있어야 유지' },
-  { value: 1, label: '수행 어려움', desc: '즉각적인 중재 필요' },
+const NA = 0; // '관찰 기회 없음' (달성률 계산에서 제외)
+
+// 고2를 취업 실습 양식으로 옮기려면 이 목록에 '고2'를 추가하세요.
+const SENIOR_GRADES = ['고3', '전공과'];
+const trackOf = (grade: string): Track => (SENIOR_GRADES.includes(grade) ? 'senior' : 'junior');
+const TRACK_LABEL: Record<Track, string> = { junior: '저학년 양식 (중학교~고2)', senior: '취업 실습 양식 (고3·전공과)' };
+
+const SCALE_SENIOR: ScaleOption[] = [
+  { value: 4, label: '독립적 수행', desc: '관리자의 지시나 촉구 없이 스스로 상황에 맞게 행동함 (취업 유지 가능 수준)' },
+  { value: 3, label: '최소 지원', desc: '1~2회의 가벼운 언어적·시각적 촉구가 있으면 수행함' },
+  { value: 2, label: '집중 지원', desc: '지속적인 안내와 감독이 있어야만 업무와 태도를 유지함' },
+  { value: 1, label: '수행 어려움', desc: '즉각적인 중재가 필요하거나, 타인의 업무를 방해하여 현장 적용이 어려움' },
 ];
 
-const SCALE3: ScaleOption[] = [
-  { value: 3, label: '우수', desc: '혼자서 잘해요' },
-  { value: 2, label: '보통', desc: '가끔 도움이 필요해요' },
-  { value: 1, label: '노력필요', desc: '더 연습할래요' },
+const SCALE_TRAINING: ScaleOption[] = [
+  { value: 4, label: '독립적 수행', desc: '교사의 지시나 촉구 없이 스스로 상황에 맞게 행동함' },
+  { value: 3, label: '최소 지원', desc: '1~2회의 가벼운 언어적·시각적 촉구가 있으면 수정하고 수행함' },
+  { value: 2, label: '집중 지원', desc: '지속적인 안내와 감독, 시범이 있어야만 과제와 태도를 유지함' },
+  { value: 1, label: '수행 어려움', desc: '즉각적인 행동 중재가 필요하거나, 타인의 활동을 방해하여 훈련 참여가 어려움' },
 ];
 
-const RUBRICS: Record<Kind, Rubric> = {
-  ojt: {
+const SCALE_SELF_JUNIOR: ScaleOption[] = [
+  { value: 3, label: '우수', desc: '혼자서 척척! 내가 알아서 잘했어요' },
+  { value: 2, label: '보통', desc: '알려줘서 고쳐서 했어요' },
+  { value: 1, label: '노력필요', desc: '오늘은 어려웠어요. 내일은 꼭!' },
+];
+
+const SCALE_SELF_SENIOR: ScaleOption[] = [
+  { value: 3, label: '우수', desc: '프로답게! 지시나 도움 없이 혼자서 해냈어요' },
+  { value: 2, label: '보통', desc: '맞춰가는 중! 한 번 알려주어서 바로 고쳤어요' },
+  { value: 1, label: '노력필요', desc: '혼자 해결하기 어려워 계속 도움을 받았어요' },
+];
+
+// 교사 평가 · 저학년 사업체 평가 공통 항목 (1학년용·중학교 루브릭)
+const TRAINING_DOMAINS: Domain[] = [
+  {
+    key: 'selfcare',
+    title: '기본 직무태도 (자기관리)',
+    items: [
+      {
+        id: 't_a1',
+        label: '위생 및 복장',
+        prompt: '정해진 복장을 스스로 착용하고, 청결한 상태로 훈련장에 입실하는가?',
+        anchors: [
+          '정해진 복장을 스스로 갖추고 청결한 상태로 시작함',
+          '복장·청결을 한 번 짚어 주면 바로 고침',
+          '복장을 갖추는 과정을 매번 하나하나 도와주어야 함',
+          '복장 착용을 거부하거나 위생 상태 때문에 참여가 어려움',
+        ],
+      },
+      {
+        id: 't_a2',
+        label: '시간 엄수',
+        prompt: '정해진 훈련 시작 시간을 지키고, 허락 없이 훈련 장소를 이탈하지 않는가?',
+        anchors: [
+          '시작 시간을 스스로 지키고 허락 없이 자리를 뜨지 않음',
+          '한 번 알려주면 시간에 맞춰 오고 자리를 지킴',
+          '시작·복귀 때마다 데리러 가거나 계속 확인해야 함',
+          '자주 늦거나 무단으로 이탈해 활동이 중단됨',
+        ],
+      },
+      {
+        id: 't_a3',
+        label: '정리 정돈',
+        prompt: '훈련이 끝난 후 자신이 사용한 도구와 자리를 스스로 정리하는가?',
+        anchors: [
+          '끝나면 사용한 도구와 자리를 스스로 정리함',
+          '"정리하자" 한 번 말하면 스스로 정리함',
+          '무엇을 어디에 둘지 하나씩 알려줘야 정리함',
+          '정리를 거부하거나 그대로 두고 자리를 떠남',
+        ],
+      },
+    ],
+  },
+  {
+    key: 'receptive',
+    title: '의사소통 및 수용성',
+    items: [
+      {
+        id: 't_c1',
+        label: '지시 집중력',
+        prompt: '교사가 새로운 과제나 방법을 설명할 때, 시선을 맞추고 경청하는가?',
+        anchors: [
+          '설명할 때 시선을 맞추고 끝까지 듣고 따라 함',
+          '이름을 한 번 부르면 다시 집중해 들음',
+          '시범과 반복 설명이 있어야 내용을 따라옴',
+          '설명 중 자리를 뜨거나 방해 행동으로 전달이 어려움',
+        ],
+      },
+      {
+        id: 't_c2',
+        label: '행동 교정 수용',
+        prompt: '잘못된 행동이나 작업 방식에 대해 교사가 지적(피드백)했을 때, 고집부리지 않고 행동을 수정하는가?',
+        anchors: [
+          '지적을 받으면 바로 받아들이고 방식을 고침',
+          '머뭇거리지만 한 번 더 설명하면 고쳐서 함',
+          '여러 번 시범을 보이고 함께 해야 조금씩 고침',
+          '고집을 부리거나 거부해 수정이 이루어지지 않음',
+        ],
+      },
+      {
+        id: 't_c3',
+        label: '자기 옹호 (도움 요청)',
+        prompt: '과제가 너무 어렵거나 진행이 막혔을 때, 포기하거나 엎드리지 않고 교사에게 다가와 도움을 요청하는가?',
+        anchors: [
+          '막히면 스스로 다가오거나 손을 들어 도움을 요청함',
+          '"도와줄까?" 신호를 주면 요청 표현을 함',
+          '멈춰 있어 먼저 다가가 상황을 물어봐야 함',
+          '포기하거나 엎드리는 등 요청 없이 활동을 중단함',
+        ],
+      },
+    ],
+  },
+  {
+    key: 'persistence',
+    title: '과제 지속성',
+    items: [
+      {
+        id: 't_p1',
+        label: '착석 및 과제 유지',
+        prompt: '본인에게 주어진 과제 분량이 끝날 때까지 딴청을 피우지 않고 자리에 머물며 집중을 유지하는가?',
+        anchors: [
+          '정해진 분량이 끝날 때까지 자리에서 집중함',
+          '가끔 딴청을 피우지만 한 번 말하면 돌아옴',
+          '곁에서 계속 이끌어야 분량을 마칠 수 있음',
+          '자리 이탈이 잦아 과제를 거의 마치지 못함',
+        ],
+      },
+      {
+        id: 't_p2',
+        label: '반복 작업 인내력',
+        prompt: '단순하고 반복적인 기초 훈련 시, 지루해하거나 거부 반응을 보이지 않고 일정 시간(예: 20분 이상) 지속하는가?',
+        anchors: [
+          '반복 작업을 20분 이상 스스로 지속함',
+          '중간에 한 번 독려하면 끝까지 지속함',
+          '짧은 휴식과 잦은 독려가 있어야 이어감',
+          '거부 반응이 커서 반복 작업 참여가 어려움',
+        ],
+      },
+    ],
+  },
+  {
+    key: 'safety',
+    title: '안전수칙 준수 및 감정 조절',
+    items: [
+      {
+        id: 't_s1',
+        label: '작업장 안전수칙 준수',
+        prompt: '도구(가위, 칼, 조리기구 등) 사용 및 훈련장 내 이동 시, 교사가 안내한 안전수칙을 엄격하게 준수하는가?',
+        anchors: [
+          '도구 사용·이동 시 안전수칙을 스스로 지킴',
+          '한 번 짚어 주면 바로 안전하게 고쳐서 함',
+          '도구를 쓸 때마다 곁에서 지켜보며 안내해야 함',
+          '안전수칙을 반복해서 어겨 도구 사용을 맡기기 어려움',
+        ],
+      },
+      {
+        id: 't_s2',
+        label: '기본 안전 인지',
+        prompt: '위험한 상황(뜨거운 물, 날카로운 물건, 기계 작동 등)을 스스로 인지하고, 함부로 만지거나 장난치지 않는가?',
+        anchors: [
+          '위험한 물건·상황을 알아채고 스스로 피함',
+          '"위험해" 한 번 알려주면 바로 멈춤',
+          '위험한 물건 근처에서는 계속 곁에서 지켜봐야 함',
+          '위험한 것을 만지거나 장난쳐서 즉시 제지가 필요함',
+        ],
+      },
+      {
+        id: 't_s3',
+        label: '실패 시 감정 조절',
+        prompt: '뜻대로 과제가 수행되지 않거나 실수를 했을 때, 소리 지르기나 자해 등 부적절한 행동 없이 감정을 통제하는가?',
+        anchors: [
+          '실수해도 차분하게 다시 시도함',
+          '속상해하지만 짧게 달래 주면 다시 참여함',
+          '진정 시간과 지속적인 도움이 있어야 다시 참여함',
+          '소리 지르기·자해 등 즉각적인 중재가 필요한 행동이 나타남',
+        ],
+      },
+    ],
+  },
+];
+
+// 저학년 사업체 평가: 교사 평가와 같은 항목을 현장 담당자 표현으로 바꿔 사용 (3자 비교가 1:1로 맞음)
+const toSiteWording = (text: string) =>
+  text
+    .replace(/교사가/g, '담당자가')
+    .replace(/교사에게/g, '담당자에게')
+    .replace(/교사의/g, '담당자의')
+    .replace(/훈련장/g, '실습장')
+    .replace(/훈련/g, '실습');
+
+const JUNIOR_SITE_DOMAINS: Domain[] = TRAINING_DOMAINS.map((d) => ({
+  ...d,
+  items: d.items.map((i) => ({
+    ...i,
+    id: i.id.replace(/^t_/, 'jo_'),
+    prompt: toSiteWording(i.prompt),
+    anchors: i.anchors?.map(toSiteWording),
+  })),
+}));
+
+const SCALE_JUNIOR_SITE: ScaleOption[] = SCALE_TRAINING.map((s) => ({ ...s, desc: toSiteWording(s.desc) }));
+
+// 고3·전공과 사업체 평가 (3학년용 루브릭)
+const SENIOR_SITE_DOMAINS: Domain[] = [
+  {
+    key: 'attitude',
+    title: '기본 직업 태도 (자기관리)',
+    items: [
+      {
+        id: 'a1',
+        label: '위생 및 복장',
+        prompt: '출근 시 씻고 왔는지, 머리와 옷차림은 깨끗한지 등 직장인으로서 기본 위생 상태가 좋습니까?',
+        anchors: [
+          '매일 스스로 단정한 상태로 출근하고, 더러워지면 알아서 정리함',
+          '가끔 머리·옷매무새를 짚어 주면 바로 고침',
+          '위생·복장 상태를 매번 확인하고 챙겨 주어야 함',
+          '지적해도 개선되지 않아 고객·위생 기준에 맞지 않음',
+        ],
+      },
+      {
+        id: 'a2',
+        label: '시간 엄수 및 근태',
+        prompt: '지각하지 않고 출퇴근 시간을 잘 지키며, 허락 없이 마음대로 자리를 비우지 않습니까?',
+        anchors: [
+          '지각·무단 이탈 없이 출퇴근 시간을 스스로 지킴',
+          '가끔 늦거나 자리를 비우지만 한 번 말하면 고침',
+          '출근 확인 연락이나 자리 확인을 계속 해야 함',
+          '잦은 지각·무단 이탈로 근무 일정 운영이 어려움',
+        ],
+      },
+      {
+        id: 'a3',
+        label: '휴게 시간 준수',
+        prompt: '일할 때와 쉴 때를 잘 구분하며, 쉬는 시간이 끝나면 알아서 자기 자리로 돌아와 일할 준비를 합니까?',
+        anchors: [
+          '쉬는 시간이 끝나면 스스로 자리로 돌아와 일을 시작함',
+          '"시간 됐어요" 한 번 알려주면 바로 복귀함',
+          '매번 불러야 복귀하고, 쉬는 시간이 자주 길어짐',
+          '휴식과 업무 구분이 어려워 업무 흐름이 끊김',
+        ],
+      },
+    ],
+  },
+  {
+    key: 'communication',
+    title: '의사소통 및 대인관계',
+    items: [
+      {
+        id: 'c1',
+        label: '지시 수용',
+        prompt: '지시받은 업무를 불만 없이 수용하며, 지시된 내용과 기한에 맞게 수행합니까?',
+        anchors: [
+          '지시를 불평 없이 받아들이고 내용·기한에 맞게 끝냄',
+          '지시 내용을 한 번 더 확인해 주면 맞게 수행함',
+          '지시를 여러 번 반복하고 옆에서 지켜봐야 수행함',
+          '지시를 거부하거나 무시해 업무 배정이 어려움',
+        ],
+      },
+      {
+        id: 'c2',
+        label: '도움 요청 (자기옹호)',
+        prompt: '일하다 모르는 것이 생기거나 실수를 했을 때, 제멋대로 넘겨짚지 않고 질문이나 도움을 요청합니까?',
+        anchors: [
+          '모르거나 실수하면 스스로 먼저 질문하거나 알림',
+          '"모르면 물어봐요"라고 상기시켜 주면 질문함',
+          '멈춰 있거나 짐작으로 진행해 먼저 다가가 확인해야 함',
+          '문제가 생겨도 알리지 않아 실수가 반복되거나 커짐',
+        ],
+      },
+      {
+        id: 'c4',
+        label: '피드백 수용 (실수 인정·수정)',
+        prompt: '실수가 발생했을 때, 솔직히 인정하고 지적받은 내용을 수정하여 수행합니까?',
+        anchors: [
+          '실수를 솔직히 인정하고, 지적받은 내용을 다음부터 스스로 고침',
+          '지적하면 수긍하고, 한두 번 더 짚어 주면 고쳐서 함',
+          '같은 지적을 여러 번 해야 조금씩 고쳐짐',
+          '실수를 부인하거나 지적에 강하게 반발함',
+        ],
+      },
+      {
+        id: 'c3',
+        label: '직장 예절',
+        prompt: '사장님이나 같이 일하는 동료들에게 출퇴근 인사, 감사, 사과 등의 예의 바른 표현을 잘 씁니까?',
+        anchors: [
+          '출퇴근 인사, 감사·사과 표현을 스스로 상황에 맞게 함',
+          '인사를 가끔 놓치지만 한 번 알려주면 바로 함',
+          '인사·예의 표현을 매번 알려줘야 함',
+          '무례한 말이나 행동으로 동료·고객이 불편해함',
+        ],
+      },
+    ],
+  },
+  {
+    key: 'engagement',
+    title: '직무 참여 및 감정 조절',
+    items: [
+      {
+        id: 'e1',
+        label: '과제 지속성',
+        prompt: '맡은 일이 끝날 때까지 딴짓하거나 돌아다니지 않고 자기 자리에 앉아 집중해서 일합니까?',
+        anchors: [
+          '맡은 일이 끝날 때까지 자리에서 집중해 마무리함',
+          '가끔 딴짓을 하지만 한 번 말하면 다시 집중함',
+          '자주 멈추거나 돌아다녀 계속 곁에서 이끌어야 함',
+          '작업을 중간에 그만두거나 자리를 떠서 맡기기 어려움',
+        ],
+      },
+      {
+        id: 'e2',
+        label: '감정 조절 / 스트레스 대처',
+        prompt: '피곤하거나 지적을 받았을 때, 짜증을 내거나 물건을 던지는 등의 돌발 행동 없이 차분하게 감정을 조절합니까?',
+        anchors: [
+          '피곤하거나 지적받아도 차분하게 감정을 조절함',
+          '표정이 굳거나 짜증이 보이지만 잠시 쉬면 회복함',
+          '짜증·불평이 자주 드러나 진정시키는 도움이 필요함',
+          '소리 지르기·물건 던지기 등 돌발 행동이 나타남',
+        ],
+      },
+      {
+        id: 'e4',
+        label: '안전장비·작업복 착용',
+        prompt: '사업체에 정해진 안전장비와 작업복을 철저히 착용합니까?',
+        anchors: [
+          '정해진 안전장비·작업복을 스스로 빠짐없이 착용함',
+          '가끔 빠뜨리지만 한 번 알려주면 바로 착용함',
+          '착용 여부를 매번 확인하고 챙겨 주어야 함',
+          '알려줘도 착용을 거부하거나 자주 벗어 위험함',
+        ],
+      },
+      {
+        id: 'e3',
+        label: '안전 수칙 준수 (작업 절차)',
+        prompt: '사업체의 작업 절차와 안전 규정을 준수합니까?',
+        anchors: [
+          '작업 절차와 안전 규정을 스스로 지킴',
+          '가끔 절차를 건너뛰지만 한 번 짚어 주면 지킴',
+          '위험 작업마다 곁에서 지켜보며 안내해야 함',
+          '안전 규정을 반복해서 어겨 사고 위험이 있음',
+        ],
+      },
+    ],
+  },
+  {
+    key: 'performance',
+    title: '실제 직무 성과 및 유연성 (생산성)',
+    items: [
+      {
+        id: 'p1',
+        label: '작업 정확성',
+        prompt: '처음 알려준 방법대로 불량이나 실수 없이 작업을 깔끔하게 마무리합니까?',
+        anchors: [
+          '배운 방법대로 불량·실수 없이 깔끔하게 마무리함',
+          '가끔 실수가 있지만 한 번 알려주면 바로 고침',
+          '결과물을 자주 확인하고 다시 하게 해야 함',
+          '불량이 잦아 결과물을 그대로 쓰기 어려움',
+        ],
+      },
+      {
+        id: 'p2',
+        label: '작업 속도',
+        prompt: '주어진 시간 안에 딴청 피우지 않고 요구하는 작업량(개수·진도)을 채웁니까?',
+        anchors: [
+          '주어진 시간 안에 요구하는 작업량을 스스로 채움',
+          '속도를 한 번 독려하면 작업량을 채움',
+          '계속 독려해도 작업량의 절반 정도 수준임',
+          '작업량을 거의 채우지 못해 업무 대체가 필요함',
+        ],
+      },
+      {
+        id: 'p4',
+        label: '작업 숙달 (일정한 페이스)',
+        prompt: '시간이 지나도 일정한 작업 페이스를 유지합니까?',
+        anchors: [
+          '시간이 지나도 일정한 속도와 품질을 유지함',
+          '후반에 느려지지만 한 번 독려하면 페이스를 되찾음',
+          '기복이 커서 중간중간 점검하고 조정해야 함',
+          '금방 지치거나 흐트러져 페이스 유지가 어려움',
+        ],
+      },
+      {
+        id: 'p3',
+        label: '돌발 상황 대처 (순서·담당자 변경)',
+        prompt: '갑자기 작업 순서가 바뀌거나 담당자가 교체되어도 당황하지 않고 새로운 지시를 잘 따릅니까?',
+        anchors: [
+          '순서나 담당자가 바뀌어도 당황하지 않고 새 지시를 따름',
+          '잠시 멈칫하지만 한 번 설명해 주면 바로 적응함',
+          '변화가 생기면 자세한 설명과 적응 시간이 필요함',
+          '변화가 생기면 작업을 멈추거나 거부해 진행이 어려움',
+        ],
+      },
+      {
+        id: 'p5',
+        label: '돌발 상황 대처 (비상 상황 보고)',
+        prompt: '기기 고장, 물품 부족 등 비상 상황이 발생하면 즉시 관리자에게 알리고 지시를 따릅니까?',
+        anchors: [
+          '문제가 생기면 즉시 관리자에게 알리고 지시를 따름',
+          '늦게 알리지만 물어보면 바로 설명하고 따름',
+          '문제가 생겨도 멈춰 있어 관리자가 먼저 발견해야 함',
+          '문제를 숨기거나 임의로 처리해 상황이 커짐',
+        ],
+      },
+    ],
+  },
+];
+
+// 자기평가 (연구회 서식1: 저학년·중학생 / 고3)
+const SELF_JUNIOR_DOMAINS: Domain[] = [
+  {
+    key: 'basic',
+    title: '기본 직무 태도',
+    items: [
+      { id: 's_b2', label: '시간 지키기', prompt: '늦지 않게 제시간에 도착했나요?' },
+      { id: 's_b1', label: '단정한 옷차림', prompt: '머리와 옷차림을 단정하게 하고 훈련을 시작했나요?' },
+    ],
+  },
+  {
+    key: 'advocacy',
+    title: '의사소통 및 자기 옹호',
+    items: [
+      { id: 's_a2', label: '도움 요청', prompt: '모르는 것이 있을 때, 내 마음대로 하지 않고 선생님께 다가가 질문했나요?' },
+      { id: 's_a3', label: '끝까지 듣기', prompt: '다른 사람의 말을 끝까지 잘 들었나요?' },
+      { id: 's_a1', label: '바르게 인사하기', prompt: '선생님이나 친구의 눈을 보고 바르게 인사했나요?' },
+    ],
+  },
+  {
+    key: 'persistence',
+    title: '과제 지속 및 안전수칙',
+    items: [
+      { id: 's_p1', label: '포기하지 않기', prompt: '하기 싫은 일도 중간에 포기하지 않았나요?' },
+      { id: 's_e1', label: '안전수칙', prompt: '위험한 도구를 함부로 만지지 않고, 안전수칙을 잘 지켰나요?' },
+    ],
+  },
+  {
+    key: 'emotion',
+    title: '감정 조절',
+    items: [
+      { id: 's_e2', label: '화날 때 참기', prompt: '화가 나거나 당황했을 때, 소리 지르지 않고 참았나요?' },
+      { id: 's_e3', label: '지적받을 때 참기', prompt: '일이 마음대로 안 되거나 지적을 받았을 때, 짜증 내지 않고 꾹 참았나요?' },
+    ],
+  },
+];
+
+const SELF_SENIOR_DOMAINS: Domain[] = [
+  {
+    key: 'basic',
+    title: '기본 직무 태도',
+    items: [
+      { id: 'ss_b1', label: '시간·휴게 지키기', prompt: '지각하지 않고, 쉬는 시간이 끝나면 알아서 내 자리로 돌아왔나요?' },
+      { id: 'ss_b2', label: '복장과 위생', prompt: '일터(식당, 공장 등)에 맞는 깨끗한 복장과 위생 상태를 지켰나요?' },
+    ],
+  },
+  {
+    key: 'relation',
+    title: '의사소통 및 동료 관계',
+    items: [
+      { id: 'ss_a1', label: '도움 요청', prompt: '일하다 모르는 것이 생겼을 때, 내 맘대로 하지 않고 사장님께 다가가 질문했나요?' },
+      { id: 'ss_a2', label: '동료 배려', prompt: '같이 일하는 동료들의 자리나 물건을 함부로 건드리지 않고 배려했나요?' },
+      { id: 'ss_a3', label: '바르게 인사하기', prompt: '사장님이나 동료의 눈을 보고 바르게 인사했나요?' },
+    ],
+  },
+  {
+    key: 'performance',
+    title: '실제 직무 성과',
+    items: [
+      { id: 'ss_p1', label: '포기하지 않기', prompt: '하기 싫은 일도 중간에 포기하지 않았나요?' },
+      { id: 'ss_p2', label: '정확하게 완성', prompt: '처음 배운 방법대로 불량이나 실수 없이 작업을 깔끔하게 완성했나요?' },
+      { id: 'ss_p3', label: '작업량 채우기', prompt: '딴청 피우지 않고, 사장님이 오늘 나에게 시킨 작업량(개수)을 다 채웠나요?' },
+    ],
+  },
+  {
+    key: 'flexibility',
+    title: '유연성 및 안전 (돌발 상황)',
+    items: [
+      { id: 'ss_e1', label: '안전수칙', prompt: '위험한 도구를 함부로 만지지 않고, 안전수칙을 잘 지켰나요?' },
+      { id: 'ss_e2', label: '지적받을 때 참기', prompt: '일이 마음대로 안 되거나 지적을 받았을 때, 짜증 내지 않고 참았나요?' },
+      { id: 'ss_e3', label: '변화에 맞추기', prompt: '갑자기 순서가 바뀌거나 담당자가 바뀌어도, 짜증 내지 않고 새로운 지시를 따랐나요?' },
+    ],
+  },
+];
+
+const EMPLOYER_SUMMARY_SENIOR: Option[] = [
+  { value: 'hire', label: '즉시 채용 수준', desc: 'TO가 있다면 당장 우리 회사 직원으로 채용하고 싶습니다.' },
+  { value: 'positive', label: '긍정적 검토 수준', desc: '조금만 더 연습하면 충분히 현장 취업이 가능해 보입니다.' },
+  { value: 'training', label: '추가 훈련 필요', desc: '아직은 현장 실습보다 학교에서의 기초 훈련이 더 필요해 보입니다.' },
+];
+
+const TRAINING_SUMMARY: Option[] = [
+  { value: 'advanced', label: '심화 훈련 가능', desc: '현재의 지시 수용성과 집중력으로 복잡한 직무 훈련(바리스타, 조립 등) 투입 가능' },
+  { value: 'basic', label: '기초 훈련 지속', desc: '아직은 개별적인 행동 중재와 단순 과제 반복 훈련이 더 필요함' },
+  { value: 'intensive', label: '집중 행동 중재 요망', desc: '직무 훈련 이전에 착석 유지, 감정 조절 등 선행 행동 중재가 시급함' },
+];
+
+const EMPLOYER_SUMMARY_JUNIOR: Option[] = [
+  { value: 'advanced', label: '심화 실습 가능', desc: '지금처럼 하면 더 복잡한 업무도 맡겨 볼 수 있겠습니다.' },
+  { value: 'basic', label: '기초 실습 지속', desc: '지금 수준의 단순한 업무를 더 반복해 익히면 좋겠습니다.' },
+  { value: 'intensive', label: '집중 지원 필요', desc: '실습 전에 학교에서 태도·행동 지도가 먼저 필요해 보입니다.' },
+];
+
+const FORMS: Record<FormKey, Rubric> = {
+  ojt_senior: {
+    form: 'ojt_senior',
     kind: 'ojt',
-    label: '고용주 (OJT)',
-    scale: SCALE4,
+    label: '고용주 평가 · 취업 실습 양식',
+    scale: SCALE_SENIOR,
     max: 4,
-    domains: [
-      {
-        key: 'attitude',
-        title: '기본 직업 태도',
-        items: [
-          { id: 'a1', label: '위생 및 복장' },
-          { id: 'a2', label: '시간 엄수 및 근태' },
-          { id: 'a3', label: '휴게 시간 준수' },
-        ],
-      },
-      {
-        key: 'communication',
-        title: '의사소통 및 대인관계',
-        items: [
-          { id: 'c1', label: '지시 수용' },
-          { id: 'c2', label: '도움 요청 (자기옹호)' },
-          { id: 'c3', label: '직장 예절' },
-        ],
-      },
-      {
-        key: 'engagement',
-        title: '직무 참여 및 감정 조절',
-        items: [
-          { id: 'e1', label: '과제 지속성' },
-          { id: 'e2', label: '감정 조절 / 스트레스 대처' },
-          { id: 'e3', label: '안전 수칙 준수' },
-        ],
-      },
-      {
-        key: 'performance',
-        title: '실제 직무 성과 및 유연성',
-        items: [
-          { id: 'p1', label: '작업 정확성 (품질)' },
-          { id: 'p2', label: '작업 속도 (할당량)' },
-          { id: 'p3', label: '돌발 상황 적응력 (유연성)' },
-        ],
-      },
-    ],
+    allowNA: true,
+    domains: SENIOR_SITE_DOMAINS,
     summaryTitle: '고용주 최종 만족도',
-    summaryOptions: [
-      { value: 'hire', label: '즉시 채용 수준' },
-      { value: 'positive', label: '긍정적 검토 수준' },
-      { value: 'training', label: '추가 훈련 필요' },
-    ],
+    summaryOptions: EMPLOYER_SUMMARY_SENIOR,
     commentTitle: '고용주 종합 의견 (강점 및 실전 사용 설명서)',
-    commentPlaceholder:
-      '[강점] 현장에서 확인된 강점을 적어주세요.\n[실전 사용 설명서] 이 학생과 함께 일할 때 효과적인 지시 방법, 배려가 필요한 상황을 적어주세요.',
+    commentPlaceholder: '예: 반복 작업은 잘하나, 속도가 조금 아쉽습니다. / 인사를 아주 잘합니다.',
+  },
+  ojt_junior: {
+    form: 'ojt_junior',
+    kind: 'ojt',
+    label: '고용주 평가 · 저학년 양식',
+    scale: SCALE_JUNIOR_SITE,
+    max: 4,
+    allowNA: true,
+    domains: JUNIOR_SITE_DOMAINS,
+    summaryTitle: '현장 담당자 종합 판단',
+    summaryOptions: EMPLOYER_SUMMARY_JUNIOR,
+    commentTitle: '담당자 종합 의견',
+    commentPlaceholder: '예: 정리 정돈을 스스로 잘합니다. / 설명할 때 한 번씩 이름을 불러 주면 집중합니다.',
   },
   teacher: {
+    form: 'teacher',
     kind: 'teacher',
-    label: '교사 (교내)',
-    scale: SCALE4,
+    label: '교사 평가 · 교내 직무훈련',
+    scale: SCALE_TRAINING,
     max: 4,
-    domains: [
-      {
-        key: 'selfcare',
-        title: '기본 직무태도 (자기관리)',
-        items: [
-          { id: 't_a1', label: '위생 및 복장' },
-          { id: 't_a2', label: '시간 엄수' },
-          { id: 't_a3', label: '정리 정돈' },
-        ],
-      },
-      {
-        key: 'receptive',
-        title: '의사소통 및 수용성',
-        items: [
-          { id: 't_c1', label: '지시 집중력' },
-          { id: 't_c2', label: '행동 교정 수용' },
-          { id: 't_c3', label: '자기 옹호 (도움 요청)' },
-        ],
-      },
-      {
-        key: 'persistence',
-        title: '과제 지속성',
-        items: [
-          { id: 't_p1', label: '착석 및 과제 유지' },
-          { id: 't_p2', label: '반복 작업 인내력' },
-        ],
-      },
-      {
-        key: 'safety',
-        title: '안전수칙 준수 및 감정 조절',
-        items: [
-          { id: 't_s1', label: '작업장 안전수칙 준수' },
-          { id: 't_s2', label: '기본 안전 인지' },
-          { id: 't_s3', label: '실패 시 감정 조절' },
-        ],
-      },
-    ],
+    allowNA: true,
+    domains: TRAINING_DOMAINS,
     summaryTitle: '현재 전환 핵심 기술 도달 수준',
-    summaryOptions: [
-      { value: 'advanced', label: '심화 훈련 가능' },
-      { value: 'basic', label: '기초 훈련 지속' },
-      { value: 'intensive', label: '집중 행동 중재 요망' },
-    ],
-    commentTitle: '지도 목표 설정 및 중재 계획',
-    commentPlaceholder:
-      '[지도 목표] 다음 평가까지 도달할 구체적인 행동 목표를 적어주세요.\n[중재 계획] 사용할 촉구 방법, 시각 자료, 강화 방법을 적어주세요.',
+    summaryOptions: TRAINING_SUMMARY,
+    commentTitle: '지도 목표 설정 (중재 계획)',
+    commentPlaceholder: '예: 과제 지속성은 좋으나, 지적을 받았을 때의 감정 조절 훈련이 최우선으로 필요함',
   },
-  self: {
+  self_junior: {
+    form: 'self_junior',
     kind: 'self',
-    label: '학생 (자기평가)',
-    scale: SCALE3,
+    label: '자기평가 · 저학년 양식',
+    scale: SCALE_SELF_JUNIOR,
     max: 3,
-    domains: [
-      {
-        key: 'basic',
-        title: '기초 생활',
-        items: [
-          { id: 's_b1', label: '위생', prompt: '일하기 전에 손을 씻고, 깨끗한 옷을 입어요.' },
-          { id: 's_b2', label: '시간 준수', prompt: '정해진 시간에 맞춰 도착해요.' },
-        ],
-      },
-      {
-        key: 'advocacy',
-        title: '자기옹호',
-        items: [
-          { id: 's_a1', label: '인사', prompt: '만나는 사람에게 먼저 인사해요.' },
-          { id: 's_a2', label: '질문하기', prompt: '모를 때 "어떻게 해요?", "도와주세요"라고 물어봐요.' },
-        ],
-      },
-      {
-        key: 'persistence',
-        title: '과제 지속성',
-        items: [{ id: 's_p1', label: '포기하지 않기', prompt: '어려워도 끝까지 해요.' }],
-      },
-      {
-        key: 'emotion',
-        title: '감정 조절',
-        items: [
-          { id: 's_e1', label: '안전수칙', prompt: '위험한 도구는 배운 대로 조심해서 써요.' },
-          { id: 's_e2', label: '화내지 않기', prompt: '화가 나도 소리 지르지 않고 마음을 가라앉혀요.' },
-        ],
-      },
-    ],
+    allowNA: false,
+    domains: SELF_JUNIOR_DOMAINS,
     summaryTitle: '',
     summaryOptions: [],
-    commentTitle: '선생님께 하고 싶은 말',
-    commentPlaceholder: '하고 싶은 말이 있으면 적어 주세요. (안 적어도 괜찮아요)',
+    commentTitle: '오늘 나의 훈련 되돌아보기',
+    commentPlaceholder: '',
+    reflections: [
+      { key: 'best', label: '오늘 내가 가장 잘한 점은?', placeholder: '예: 끝까지 자리에 앉아서 포장 작업을 20개 완성했습니다.' },
+      { key: 'goal', label: '내일 나의 다짐 (목표)!', placeholder: '예: 모르는 것이 생기면 손을 들고 먼저 질문하겠습니다.' },
+    ],
+  },
+  self_senior: {
+    form: 'self_senior',
+    kind: 'self',
+    label: '자기평가 · 취업 실습 양식',
+    scale: SCALE_SELF_SENIOR,
+    max: 3,
+    allowNA: false,
+    domains: SELF_SENIOR_DOMAINS,
+    summaryTitle: '',
+    summaryOptions: [],
+    commentTitle: '오늘 나의 실습 되돌아보기',
+    commentPlaceholder: '',
+    reflections: [
+      { key: 'best', label: '오늘 내가 가장 잘한 점은?', placeholder: '예: 끝까지 자리에 앉아서 포장 작업을 20개 완성했습니다.' },
+      { key: 'praise', label: '오늘 사장님(관리자)에게 칭찬받은 점은?', placeholder: '예: 박스 접기 50개를 시간 안에 다 채웠다고 칭찬받았습니다.' },
+      { key: 'goal', label: '내일 나의 다짐 (목표)!', placeholder: '예: 갑자기 다른 일을 시키셔도 당황하지 않고 "네!" 하고 대답하겠습니다.' },
+    ],
   },
 };
 
+const formFor = (kind: Kind, grade: string): FormKey => {
+  const t = trackOf(grade);
+  if (kind === 'teacher') return 'teacher';
+  if (kind === 'ojt') return t === 'senior' ? 'ojt_senior' : 'ojt_junior';
+  return t === 'senior' ? 'self_senior' : 'self_junior';
+};
+// 양식 기록이 없는 예전 평가는 당시 사용하던 양식으로 해석
+const formOf = (row: { kind: Kind; form: FormKey | null }): FormKey =>
+  row.form ?? (row.kind === 'ojt' ? 'ojt_senior' : row.kind === 'teacher' ? 'teacher' : 'self_junior');
+const rubricOf = (row: { kind: Kind; form: FormKey | null }) => FORMS[formOf(row)];
+
 const KINDS: Kind[] = ['ojt', 'teacher', 'self'];
 const KIND_SHORT: Record<Kind, string> = { ojt: '고용주', teacher: '교사', self: '학생' };
+const KIND_LABEL: Record<Kind, string> = { ojt: '고용주 (OJT)', teacher: '교사 (교내)', self: '학생 (자기평가)' };
 
-// 3자 통합 차트용 공통 축: 의미가 같은 항목끼리 묶어 달성률(%)로 비교
-const INTEGRATED_AXES: { key: string; label: string; items: Record<Kind, string[]> }[] = [
+// 3자 통합 차트용 공통 축: 양식마다 의미가 같은 항목끼리 묶어 달성률(%)로 비교
+type Axis = { key: string; label: string; items: Partial<Record<FormKey, string[]>> };
+const INTEGRATED_AXES: Axis[] = [
   {
     key: 'selfcare',
     label: '자기관리',
-    items: { ojt: ['a1', 'a2', 'a3'], teacher: ['t_a1', 't_a2', 't_a3'], self: ['s_b1', 's_b2'] },
+    items: {
+      ojt_senior: ['a1', 'a2', 'a3'],
+      ojt_junior: ['jo_a1', 'jo_a2', 'jo_a3'],
+      teacher: ['t_a1', 't_a2', 't_a3'],
+      self_junior: ['s_b1', 's_b2'],
+      self_senior: ['ss_b1', 'ss_b2'],
+    },
   },
   {
     key: 'advocacy',
     label: '의사소통·자기옹호',
-    items: { ojt: ['c1', 'c2', 'c3'], teacher: ['t_c1', 't_c2', 't_c3'], self: ['s_a1', 's_a2'] },
+    items: {
+      ojt_senior: ['c1', 'c2', 'c4', 'c3'],
+      ojt_junior: ['jo_c1', 'jo_c2', 'jo_c3'],
+      teacher: ['t_c1', 't_c2', 't_c3'],
+      self_junior: ['s_a1', 's_a2', 's_a3'],
+      self_senior: ['ss_a1', 'ss_a2', 'ss_a3'],
+    },
   },
   {
     key: 'persistence',
     label: '과제 지속성',
-    items: { ojt: ['e1'], teacher: ['t_p1', 't_p2'], self: ['s_p1'] },
+    items: {
+      ojt_senior: ['e1'],
+      ojt_junior: ['jo_p1', 'jo_p2'],
+      teacher: ['t_p1', 't_p2'],
+      self_junior: ['s_p1'],
+      self_senior: ['ss_p1'],
+    },
   },
   {
     key: 'safety',
     label: '안전·감정 조절',
-    items: { ojt: ['e2', 'e3'], teacher: ['t_s1', 't_s2', 't_s3'], self: ['s_e1', 's_e2'] },
+    items: {
+      ojt_senior: ['e2', 'e4', 'e3'],
+      ojt_junior: ['jo_s1', 'jo_s2', 'jo_s3'],
+      teacher: ['t_s1', 't_s2', 't_s3'],
+      self_junior: ['s_e1', 's_e2', 's_e3'],
+      self_senior: ['ss_e1', 'ss_e2'],
+    },
   },
 ];
+// 취업 실습 양식에만 있는 영역 (교사 평가에는 없어서 차트에서는 빼고 비교표에만 표시)
+const PERFORMANCE_AXIS: Axis = {
+  key: 'performance',
+  label: '직무 성과·유연성',
+  items: { ojt_senior: ['p1', 'p2', 'p4', 'p3', 'p5'], self_senior: ['ss_p2', 'ss_p3', 'ss_e3'] },
+};
 
 const SERIES_STYLE: Record<Kind, { stroke: string; strokeWidth: number; dash?: string; fill: string; fillOpacity: number }> = {
   ojt: { stroke: '#171717', strokeWidth: 3, fill: '#171717', fillOpacity: 0 },
@@ -364,21 +833,26 @@ const FIELD_SUGGESTIONS = ['제과제빵 보조', '레스토랑 외식서비스'
 // 3. 계산 로직
 // ─────────────────────────────────────────────
 const allItems = (rubric: Rubric) => rubric.domains.flatMap((d) => d.items);
+const isScored = (v: number | undefined): v is number => typeof v === 'number' && v >= 1;
+// 달성률 = 응답 점수 합 ÷ (응답 항목 수 × 만점). '관찰 기회 없음'과 미응답 항목은 빼고 계산
 const rateOf = (scores: Record<string, number>, ids: string[], max: number) => {
-  if (ids.length === 0) return 0;
-  const sum = ids.reduce((acc, id) => acc + (scores[id] ?? 0), 0);
-  return Math.round((sum / (ids.length * max)) * 100);
+  const valid = ids.filter((id) => isScored(scores[id]));
+  if (valid.length === 0) return 0;
+  const sum = valid.reduce((acc, id) => acc + scores[id], 0);
+  return Math.round((sum / (valid.length * max)) * 100);
 };
+const rateOrNull = (scores: Record<string, number>, ids: string[], max: number) =>
+  ids.some((id) => isScored(scores[id])) ? rateOf(scores, ids, max) : null;
+const pct = (n: number | null) => (n === null ? '-' : `${n}%`);
 const overallRate = (row: EvaluationRow) => {
-  const rubric = RUBRICS[row.kind];
+  const rubric = rubricOf(row);
   return rateOf(row.scores, allItems(rubric).map((i) => i.id), rubric.max);
 };
 const domainRate = (row: EvaluationRow, domain: Domain) =>
-  rateOf(row.scores, domain.items.map((i) => i.id), RUBRICS[row.kind].max);
-const axisRate = (row: EvaluationRow, axis: (typeof INTEGRATED_AXES)[number]) =>
-  rateOf(row.scores, axis.items[row.kind], RUBRICS[row.kind].max);
-const optionLabel = (kind: Kind, value: string | null) =>
-  RUBRICS[kind].summaryOptions.find((o) => o.value === value)?.label ?? '-';
+  rateOrNull(row.scores, domain.items.map((i) => i.id), rubricOf(row).max);
+const axisRate = (row: EvaluationRow, axis: Axis) => rateOrNull(row.scores, axis.items[formOf(row)] ?? [], rubricOf(row).max);
+const optionLabel = (row: EvaluationRow) => rubricOf(row).summaryOptions.find((o) => o.value === row.summary)?.label ?? '-';
+const naCount = (row: EvaluationRow) => allItems(rubricOf(row)).filter((i) => row.scores[i.id] === NA).length;
 
 const byTimeAsc = (a: EvaluationRow, b: EvaluationRow) =>
   a.evaluated_at.localeCompare(b.evaluated_at) || a.created_at.localeCompare(b.created_at);
@@ -453,12 +927,115 @@ export default function App() {
 }
 
 // ─────────────────────────────────────────────
-// 5-1. 링크 평가 화면 (사장님 OJT / 학생 자기평가 공용)
+// 5-0. 항목 하나 채점 (점수 버튼 + 관찰 기회 없음 + 점수별 행동 예시)
+// ─────────────────────────────────────────────
+function ItemScorer({
+  item,
+  scale,
+  allowNA,
+  value,
+  onChange,
+  large = false,
+}: {
+  item: RubricItem;
+  scale: ScaleOption[];
+  allowNA: boolean;
+  value: number | undefined;
+  onChange: (v: number) => void;
+  large?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const selectedIndex = scale.findIndex((sc) => sc.value === value);
+  const anchor = item.anchors && selectedIndex >= 0 ? item.anchors[selectedIndex] : null;
+
+  return (
+    <div className={large ? 'py-6' : 'py-5'}>
+      {large ? (
+        <p className="text-lg font-semibold leading-relaxed">{item.prompt}</p>
+      ) : (
+        <>
+          <p className="text-sm font-bold">{item.label}</p>
+          <p className="text-sm text-neutral-600 mt-1 leading-relaxed">{item.prompt}</p>
+        </>
+      )}
+      <div className="max-w-xl">
+        <div className={`grid mt-3 ${scale.length === 3 ? 'grid-cols-3 gap-3' : 'grid-cols-4 gap-2'}`}>
+          {scale.map((sc) => {
+            const active = value === sc.value;
+            return (
+              <button
+                key={sc.value}
+                type="button"
+                aria-pressed={active}
+                onClick={() => onChange(sc.value)}
+                className={`border-2 transition-colors ${large ? 'py-4' : 'py-3'} ${
+                  active ? 'bg-neutral-900 border-neutral-900 text-white' : 'border-neutral-300 hover:border-neutral-900'
+                }`}
+              >
+                {large ? (
+                  <>
+                    <span className="block text-xl font-black">{sc.label}</span>
+                    <span className={`block text-sm mt-1 px-1 ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>{sc.desc}</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="block text-base font-black">{sc.value}</span>
+                    <span className={`block text-[11px] mt-0.5 ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>{sc.label}</span>
+                  </>
+                )}
+              </button>
+            );
+          })}
+        </div>
+        {allowNA && (
+          <button
+            type="button"
+            aria-pressed={value === NA}
+            onClick={() => onChange(NA)}
+            className={`mt-2 w-full border-2 border-dashed py-2 text-xs font-bold transition-colors ${
+              value === NA ? 'bg-neutral-200 border-neutral-500 text-neutral-900' : 'border-neutral-300 text-neutral-500 hover:border-neutral-900'
+            }`}
+          >
+            관찰 기회 없음
+          </button>
+        )}
+        {item.anchors && (
+          <div className="mt-2">
+            {anchor ? (
+              <p className="text-xs text-neutral-700 border-l-4 border-neutral-900 pl-2 py-0.5 leading-relaxed">
+                {value}점 행동 예시: {anchor}
+              </p>
+            ) : value === NA ? (
+              <p className="text-xs text-neutral-500 border-l-4 border-neutral-300 pl-2 py-0.5">이 항목은 달성률 계산에서 제외됩니다.</p>
+            ) : null}
+            <button type="button" onClick={() => setOpen((v) => !v)} className="mt-1.5 text-xs text-neutral-500 underline hover:text-neutral-900">
+              {open ? '행동 예시 접기' : '점수별 행동 예시 보기'}
+            </button>
+            {open && (
+              <ul className="mt-2 border-2 border-neutral-200 divide-y divide-neutral-200 text-xs">
+                {scale.map((sc, i) => (
+                  <li key={sc.value} className={`flex gap-3 px-3 py-2 leading-relaxed ${value === sc.value ? 'bg-neutral-100 font-semibold' : ''}`}>
+                    <span className="w-16 shrink-0 font-bold">
+                      {sc.value}점 {sc.label}
+                    </span>
+                    <span>{item.anchors?.[i]}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────
+// 5-1. 링크 평가 화면 (사장님 OJT / 학생 자기평가 공용, 학년별 양식 자동 적용)
 // ─────────────────────────────────────────────
 type LinkContext = { name: string; grade: string | null; main_field: string | null; site: string | null };
 
 function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) {
-  const rubric = RUBRICS[kind];
   const isSelf = kind === 'self';
   const [ctx, setCtx] = useState<LinkContext | null>(null);
   const [loading, setLoading] = useState(true);
@@ -466,6 +1043,7 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
   const [scores, setScores] = useState<Record<string, number>>({});
   const [summary, setSummary] = useState<string | null>(null);
   const [comment, setComment] = useState('');
+  const [reflections, setReflections] = useState<Record<string, string>>({});
   const [evaluator, setEvaluator] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState('');
@@ -493,27 +1071,40 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
     };
   }, [token, kind, isSelf]);
 
+  const form = formFor(kind, ctx?.grade ?? '');
+  const rubric = FORMS[form];
   const items = allItems(rubric);
   const answered = items.filter((i) => scores[i.id] != null).length;
 
   const handleSubmit = async () => {
     const remaining = items.length - answered;
     if (remaining > 0) {
-      setSubmitError(isSelf ? `아직 고르지 않은 질문이 ${remaining}개 있어요.` : `평가하지 않은 항목이 ${remaining}개 있습니다.`);
+      setSubmitError(
+        isSelf
+          ? `아직 고르지 않은 질문이 ${remaining}개 있어요.`
+          : `선택하지 않은 항목이 ${remaining}개 있습니다. 관찰할 기회가 없었다면 '관찰 기회 없음'을 눌러 주십시오.`
+      );
       return;
     }
     if (!isSelf && !summary) {
-      setSubmitError(`${rubric.summaryTitle}를 선택해 주십시오.`);
+      setSubmitError(`'${rubric.summaryTitle}' 항목을 선택해 주십시오.`);
       return;
     }
+    const finalComment = isSelf
+      ? (rubric.reflections ?? [])
+          .filter((r) => reflections[r.key]?.trim())
+          .map((r) => `[${r.label}] ${reflections[r.key].trim()}`)
+          .join('\n')
+      : comment.trim();
     setSubmitting(true);
     setSubmitError('');
     const { error } = await supabase.rpc('submit_link_evaluation', {
       p_token: token,
       p_kind: kind,
+      p_form: form,
       p_scores: scores,
       p_summary: isSelf ? null : summary,
-      p_comment: comment.trim(),
+      p_comment: finalComment,
       p_evaluator: isSelf ? null : evaluator.trim() || null,
     });
     setSubmitting(false);
@@ -528,7 +1119,9 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
   const shell = (children: ReactNode) => (
     <div className="min-h-screen bg-white text-neutral-900 font-sans">
       <header className="border-b-4 border-neutral-900 px-4 py-3 sm:px-6 sm:py-4">
-        <p className="text-lg font-black tracking-tighter">Link-路 <span className="font-bold text-neutral-500">나라T 직업교육 Lab</span></p>
+        <p className="text-lg font-black tracking-tighter">
+          Link-路 <span className="font-bold text-neutral-500">나라T 직업교육 Lab</span>
+        </p>
       </header>
       <main className="max-w-2xl mx-auto px-4 py-6 sm:px-6 sm:py-10">{children}</main>
     </div>
@@ -543,7 +1136,7 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
   if (loadError || !ctx) return shell(<p className="text-lg font-bold border-l-4 border-neutral-900 pl-4">{loadError}</p>);
   if (done)
     return shell(
-      <div className="border-2 border-neutral-900 p-10 text-center space-y-4">
+      <div className="border-2 border-neutral-900 p-8 sm:p-10 text-center space-y-4">
         <Check size={48} className="mx-auto" strokeWidth={3} />
         {isSelf ? (
           <>
@@ -554,7 +1147,7 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
           <>
             <p className="text-2xl font-black">평가가 제출되었습니다</p>
             <p className="text-base leading-relaxed">
-              바쁘신 중에 시간 내어 주셔서 감사합니다. 평가 내용은 담당 선생님께 바로 전달됩니다.
+              사장님의 솔직한 평가가 학생의 실전 취업을 위한 가장 중요한 교육 자료가 됩니다. 시간 내어 주셔서 감사합니다.
               <br />
               다음 평가 때도 같은 링크를 사용하시면 됩니다.
             </p>
@@ -563,26 +1156,23 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
       </div>
     );
 
-  const promptClass = isSelf ? 'text-lg font-semibold mb-4 leading-relaxed' : 'text-base font-semibold mb-3';
-
   return shell(
     <div className="space-y-12">
       <div>
         {isSelf ? (
           <>
             <h1 className="text-2xl sm:text-3xl font-black tracking-tight">{ctx.name}님의 자기평가</h1>
-            <p className="text-lg text-neutral-600 mt-3 leading-relaxed">요즘 일할 때 나의 모습을 생각하며, 질문마다 하나씩 골라 주세요.</p>
+            <p className="text-lg text-neutral-600 mt-3 leading-relaxed">나는 오늘... 스스로 생각하며 질문마다 하나씩 골라 주세요.</p>
           </>
         ) : (
           <>
-            <p className="text-sm text-neutral-500">현장실습(OJT) 평가</p>
-            <h1 className="text-2xl sm:text-3xl font-black tracking-tight mt-1">{ctx.name} 학생</h1>
-            <p className="text-sm text-neutral-600 mt-2">
-              {[ctx.site, ctx.main_field, ctx.grade].filter(Boolean).join(' · ')}
-            </p>
+            <p className="text-sm text-neutral-500">현장실습(OJT) 평가 · {form === 'ojt_senior' ? '취업 실습' : '저학년 현장실습'}</p>
+            <h1 className="text-2xl sm:text-3xl font-black tracking-tight mt-1">사장님, {ctx.name} 학생을 평가해 주세요</h1>
+            <p className="text-sm text-neutral-600 mt-2">{[ctx.site, ctx.main_field, ctx.grade].filter(Boolean).join(' · ')}</p>
             <p className="text-base text-neutral-700 mt-5 leading-relaxed border-l-4 border-neutral-900 pl-4">
-              학생이 현장에서 보인 모습을 기준으로 항목마다 하나씩 선택해 주십시오. 약 3분이 걸리며, 가입이나 로그인 없이 바로
-              제출됩니다.
+              학생이 현장에서 보인 모습을 기준으로 항목마다 하나씩 선택해 주십시오. 관찰할 기회가 없었던 항목은{' '}
+              <b>관찰 기회 없음</b>을 누르시면 됩니다. 점수가 고민될 때는 <b>점수별 행동 예시</b>를 참고해 주십시오. 약 5분이
+              걸리며, 가입이나 로그인 없이 바로 제출됩니다.
             </p>
           </>
         )}
@@ -591,10 +1181,10 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
       {!isSelf && (
         <section>
           <h2 className="text-sm font-bold mb-3">평가 기준</h2>
-          <div className="grid grid-cols-2 gap-0.5 bg-neutral-900 border-2 border-neutral-900">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-0.5 bg-neutral-900 border-2 border-neutral-900">
             {rubric.scale.map((sc) => (
               <div key={sc.value} className="bg-white p-4">
-                <p className="text-lg font-black">
+                <p className="text-base font-black">
                   {sc.value}점 · {sc.label}
                 </p>
                 <p className="text-xs text-neutral-500 mt-1 leading-relaxed">{sc.desc}</p>
@@ -606,42 +1196,20 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
 
       {rubric.domains.map((domain, di) => (
         <section key={domain.key}>
-          <h2 className="text-xl font-bold border-b-4 border-neutral-900 pb-2 mb-2">
+          <h2 className="text-xl font-bold border-b-4 border-neutral-900 pb-2 mb-1">
             {di + 1}. {domain.title}
           </h2>
           <div className="divide-y divide-neutral-200">
             {domain.items.map((item) => (
-              <div key={item.id} className={isSelf ? 'py-6' : 'py-5'}>
-                <p className={promptClass}>{item.prompt ?? item.label}</p>
-                <div className={`grid gap-2 ${isSelf ? 'grid-cols-3 gap-3' : 'grid-cols-4'}`}>
-                  {rubric.scale.map((sc) => {
-                    const active = scores[item.id] === sc.value;
-                    return (
-                      <button
-                        key={sc.value}
-                        type="button"
-                        aria-pressed={active}
-                        onClick={() => setScores((prev) => ({ ...prev, [item.id]: sc.value }))}
-                        className={`border-2 transition-colors ${isSelf ? 'py-4' : 'py-3'} ${
-                          active ? 'bg-neutral-900 border-neutral-900 text-white' : 'border-neutral-300 hover:border-neutral-900'
-                        }`}
-                      >
-                        {isSelf ? (
-                          <>
-                            <span className="block text-xl font-black">{sc.label}</span>
-                            <span className={`block text-sm mt-1 ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>{sc.desc}</span>
-                          </>
-                        ) : (
-                          <>
-                            <span className="block text-base font-black">{sc.value}</span>
-                            <span className={`block text-xs mt-0.5 ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>{sc.label}</span>
-                          </>
-                        )}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
+              <ItemScorer
+                key={item.id}
+                item={item}
+                scale={rubric.scale}
+                allowNA={rubric.allowNA}
+                value={scores[item.id]}
+                onChange={(v) => setScores((prev) => ({ ...prev, [item.id]: v }))}
+                large={isSelf}
+              />
             ))}
           </div>
         </section>
@@ -650,13 +1218,13 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
       {!isSelf && (
         <section>
           <h2 className="text-xl font-bold border-b-4 border-neutral-900 pb-2 mb-4">{rubric.summaryTitle}</h2>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          <div className="space-y-2">
             {rubric.summaryOptions.map((opt) => {
               const active = summary === opt.value;
               return (
                 <label
                   key={opt.value}
-                  className={`flex items-center gap-3 border-2 px-4 py-3 cursor-pointer text-sm font-semibold transition-colors ${
+                  className={`flex items-start gap-3 border-2 px-4 py-3 cursor-pointer transition-colors ${
                     active ? 'border-neutral-900 bg-neutral-900 text-white' : 'border-neutral-300 hover:border-neutral-900'
                   }`}
                 >
@@ -666,9 +1234,12 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
                     value={opt.value}
                     checked={active}
                     onChange={() => setSummary(opt.value)}
-                    className="accent-neutral-900"
+                    className="accent-neutral-900 mt-1"
                   />
-                  {opt.label}
+                  <span>
+                    <span className="block text-sm font-bold">{opt.label}</span>
+                    {opt.desc && <span className={`block text-xs mt-0.5 ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>{opt.desc}</span>}
+                  </span>
                 </label>
               );
             })}
@@ -677,37 +1248,57 @@ function LinkEvaluationPage({ kind, token }: { kind: LinkKind; token: string }) 
       )}
 
       <section>
-        <label htmlFor="link-comment" className="block text-xl font-bold border-b-4 border-neutral-900 pb-2 mb-4">
-          {isSelf ? rubric.commentTitle : '종합 의견 (선택)'}
-        </label>
-        <textarea
-          id="link-comment"
-          value={comment}
-          onChange={(e) => setComment(e.target.value)}
-          maxLength={2000}
-          placeholder={rubric.commentPlaceholder}
-          className={`w-full h-36 border-2 border-neutral-300 p-4 focus:outline-none focus:border-neutral-900 ${isSelf ? 'text-lg' : 'text-base leading-relaxed'}`}
-        />
-        {!isSelf && (
-          <div className="mt-4">
-            <label htmlFor="link-evaluator" className="block text-sm font-semibold mb-2">
-              평가자 성함 (선택)
-            </label>
-            <input
-              id="link-evaluator"
-              value={evaluator}
-              onChange={(e) => setEvaluator(e.target.value)}
-              maxLength={50}
-              placeholder="예: 홍길동 점장"
-              className={inputClass}
-            />
+        <h2 className="text-xl font-bold border-b-4 border-neutral-900 pb-2 mb-4">
+          {isSelf ? rubric.commentTitle : '간단 코멘트 (선택)'}
+        </h2>
+        {isSelf ? (
+          <div className="space-y-5">
+            {(rubric.reflections ?? []).map((r) => (
+              <div key={r.key}>
+                <label htmlFor={`refl-${r.key}`} className="block text-lg font-semibold mb-2">
+                  {r.label}
+                </label>
+                <textarea
+                  id={`refl-${r.key}`}
+                  value={reflections[r.key] ?? ''}
+                  onChange={(e) => setReflections((prev) => ({ ...prev, [r.key]: e.target.value }))}
+                  maxLength={500}
+                  placeholder={r.placeholder}
+                  className="w-full h-24 border-2 border-neutral-300 p-4 text-lg focus:outline-none focus:border-neutral-900"
+                />
+              </div>
+            ))}
           </div>
+        ) : (
+          <>
+            <textarea
+              id="link-comment"
+              value={comment}
+              onChange={(e) => setComment(e.target.value)}
+              maxLength={2000}
+              placeholder={rubric.commentPlaceholder}
+              className="w-full h-32 border-2 border-neutral-300 p-4 text-base leading-relaxed focus:outline-none focus:border-neutral-900"
+            />
+            <div className="mt-4">
+              <label htmlFor="link-evaluator" className="block text-sm font-semibold mb-2">
+                평가자 성함 (선택)
+              </label>
+              <input
+                id="link-evaluator"
+                value={evaluator}
+                onChange={(e) => setEvaluator(e.target.value)}
+                maxLength={50}
+                placeholder="예: 홍길동 점장"
+                className={inputClass}
+              />
+            </div>
+          </>
         )}
       </section>
 
       <div className="space-y-3">
         <p className="text-base text-neutral-600">
-          {answered} / {items.length}개 {isSelf ? '골랐어요' : '항목 평가 완료'}
+          {answered} / {items.length}개 {isSelf ? '골랐어요' : '항목 선택 완료'}
         </p>
         {submitError && <p className="text-base font-bold border-l-4 border-neutral-900 pl-3">{submitError}</p>}
         <button
@@ -1259,7 +1850,8 @@ function TeacherApp({
 
   const handleSaveDraft = async () => {
     if (!selected) return;
-    const rubric = RUBRICS[draft.kind];
+    const draftForm = formFor(draft.kind, selected.grade);
+    const rubric = FORMS[draftForm];
     const missing = allItems(rubric).filter((i) => draft.scores[i.id] == null).length;
     if (missing > 0) {
       setDraftError(`채점하지 않은 항목이 ${missing}개 있습니다.`);
@@ -1289,6 +1881,7 @@ function TeacherApp({
       .insert({
         student_id: selected.id,
         kind: draft.kind,
+        form: draftForm,
         scores: draft.scores,
         summary: draft.summary,
         comment: draft.comment.trim(),
@@ -1314,13 +1907,13 @@ function TeacherApp({
           : s
       )
     );
-    setNotice(`${row.evaluated_at} ${rubric.label} 평가가 저장되었습니다.`);
+    setNotice(`${row.evaluated_at} ${rubric.label} 기록이 저장되었습니다.`);
     setDraft(emptyDraft(draft.kind));
     setTab('history');
   };
 
   const handleDeleteEvaluation = async (row: EvaluationRow) => {
-    if (!window.confirm(`${row.evaluated_at} ${RUBRICS[row.kind].label} 평가를 삭제할까요?`)) return;
+    if (!window.confirm(`${row.evaluated_at} ${KIND_LABEL[row.kind]} 평가를 삭제할까요?`)) return;
     const { error } = await supabase.from(EVALUATIONS_TABLE).delete().eq('id', row.id);
     if (error) {
       window.alert(`삭제하지 못했습니다: ${error.message}`);
@@ -1720,7 +2313,7 @@ function TeacherApp({
 
   // ── 탭 1: 새 평가 입력 ──
   const renderNewEvaluation = (s: Student) => {
-    const rubric = RUBRICS[draft.kind];
+    const rubric = FORMS[formFor(draft.kind, s.grade)];
     return (
       <div className="space-y-10 print:hidden">
         <section className="grid grid-cols-1 lg:grid-cols-[1fr_220px] gap-6 items-end">
@@ -1810,6 +2403,11 @@ function TeacherApp({
           </p>
         )}
 
+        <p className="text-xs text-neutral-500 -mt-4">
+          적용 양식: <b className="text-neutral-900">{rubric.label}</b>
+          {draft.kind === 'ojt' ? ` · ${s.grade} → ${TRACK_LABEL[trackOf(s.grade)]}` : ''} · 관찰할 기회가 없었던 항목은 '관찰 기회 없음'을 선택하세요.
+        </p>
+
         <section>
           <h3 className="text-sm font-bold mb-3">평가 척도</h3>
           <div className="grid grid-cols-2 xl:grid-cols-4 gap-0.5 bg-neutral-900 border-2 border-neutral-900">
@@ -1825,42 +2423,28 @@ function TeacherApp({
 
         {rubric.domains.map((domain, di) => {
           const ids = domain.items.map((i) => i.id);
-          const sum = ids.reduce((acc, id) => acc + (draft.scores[id] ?? 0), 0);
+          const na = ids.filter((id) => draft.scores[id] === NA).length;
           return (
             <section key={domain.key}>
               <div className="flex justify-between items-end gap-3 border-b-4 border-neutral-900 pb-2 mb-1">
                 <h3 className="text-base sm:text-lg font-bold">
                   {di + 1}. {domain.title}
                 </h3>
-                <p className="text-sm tabular-nums">
-                  <span className="font-bold">{sum}</span> / {ids.length * rubric.max}점 ·{' '}
-                  <span className="font-bold">{rateOf(draft.scores, ids, rubric.max)}%</span>
+                <p className="text-sm tabular-nums whitespace-nowrap">
+                  <span className="font-bold">{pct(rateOrNull(draft.scores, ids, rubric.max))}</span>
+                  {na > 0 && <span className="text-neutral-500 text-xs"> · 관찰 없음 {na}</span>}
                 </p>
               </div>
               <div className="divide-y divide-neutral-200">
                 {domain.items.map((item) => (
-                  <div key={item.id} className="flex flex-col xl:flex-row xl:items-center justify-between gap-3 py-4">
-                    <p className="text-sm font-semibold">{item.label}</p>
-                    <div className="grid grid-cols-4 gap-2 xl:w-[420px] xl:shrink-0">
-                      {rubric.scale.map((sc) => {
-                        const active = draft.scores[item.id] === sc.value;
-                        return (
-                          <button
-                            key={sc.value}
-                            type="button"
-                            aria-pressed={active}
-                            onClick={() => setDraft({ ...draft, scores: { ...draft.scores, [item.id]: sc.value } })}
-                            className={`border-2 py-3 xl:py-2 text-center transition-colors ${
-                              active ? 'bg-neutral-900 border-neutral-900 text-white' : 'border-neutral-300 text-neutral-600 hover:border-neutral-900'
-                            }`}
-                          >
-                            <span className="block text-sm font-bold">{sc.value}</span>
-                            <span className="block text-[11px]">{sc.label}</span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
+                  <ItemScorer
+                    key={item.id}
+                    item={item}
+                    scale={rubric.scale}
+                    allowNA={rubric.allowNA}
+                    value={draft.scores[item.id]}
+                    onChange={(v) => setDraft({ ...draft, scores: { ...draft.scores, [item.id]: v } })}
+                  />
                 ))}
               </div>
             </section>
@@ -1870,13 +2454,13 @@ function TeacherApp({
         <section>
           <h3 className="text-lg font-bold border-b-4 border-neutral-900 pb-2 mb-5">{rubric.domains.length + 1}. 종합 평가</h3>
           <p className="text-sm font-semibold mb-3">{rubric.summaryTitle}</p>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mb-6">
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-2 mb-6">
             {rubric.summaryOptions.map((opt) => {
               const active = draft.summary === opt.value;
               return (
                 <label
                   key={opt.value}
-                  className={`flex items-center gap-3 border-2 px-4 py-3 cursor-pointer text-sm font-semibold transition-colors ${
+                  className={`flex items-start gap-3 border-2 px-4 py-3 cursor-pointer text-sm font-semibold transition-colors ${
                     active ? 'border-neutral-900 bg-neutral-900 text-white' : 'border-neutral-300 hover:border-neutral-900'
                   }`}
                 >
@@ -1886,9 +2470,14 @@ function TeacherApp({
                     value={opt.value}
                     checked={active}
                     onChange={() => setDraft({ ...draft, summary: opt.value })}
-                    className="accent-neutral-900"
+                    className="accent-neutral-900 mt-1"
                   />
-                  {opt.label}
+                  <span>
+                    <span className="block">{opt.label}</span>
+                    {opt.desc && (
+                      <span className={`block text-xs font-normal mt-0.5 ${active ? 'text-neutral-300' : 'text-neutral-500'}`}>{opt.desc}</span>
+                    )}
+                  </span>
                 </label>
               );
             })}
@@ -1995,20 +2584,24 @@ function TeacherApp({
               </thead>
               <tbody className="block lg:table-row-group divide-y divide-neutral-200">
                 {newestFirst.map((row) => {
-                  const rubric = RUBRICS[row.kind];
+                  const rubric = rubricOf(row);
                   return (
                     <tr key={row.id} className="relative block lg:table-row align-top py-4 lg:py-0">
                       <td className="inline lg:table-cell lg:py-4 pr-2 lg:pr-4 tabular-nums whitespace-nowrap text-xs lg:text-sm text-neutral-500 lg:text-neutral-900">{row.evaluated_at}</td>
-                      <td className="inline lg:table-cell lg:py-4 pr-2 lg:pr-4 whitespace-nowrap font-semibold text-xs lg:text-sm">{rubric.label}</td>
+                      <td className="inline lg:table-cell lg:py-4 pr-2 lg:pr-4 whitespace-nowrap font-semibold text-xs lg:text-sm">{KIND_LABEL[row.kind]}</td>
                       <td className="block lg:table-cell lg:py-4 lg:pr-4 lg:text-right font-black tabular-nums text-2xl lg:text-sm mt-1 lg:mt-0">{overallRate(row)}%</td>
                       <td className="block lg:table-cell lg:py-4 lg:pr-4 mt-2 lg:mt-0">
                         <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-neutral-600">
                           {rubric.domains.map((d) => (
                             <span key={d.key} className="whitespace-nowrap">
-                              {d.title.replace(/\s*\(.*\)/, '')} <b className="text-neutral-900 tabular-nums">{domainRate(row, d)}%</b>
+                              {d.title.replace(/\s*\(.*\)/, '')} <b className="text-neutral-900 tabular-nums">{pct(domainRate(row, d))}</b>
                             </span>
                           ))}
                         </div>
+                        <p className="text-[11px] text-neutral-400 mt-1">
+                          {rubric.label}
+                          {naCount(row) > 0 ? ` · 관찰 기회 없음 ${naCount(row)}개` : ''}
+                        </p>
                         {(sourceLabel(row) || row.evaluator) && (
                           <p className="text-xs text-neutral-500 mt-2">
                             {[sourceLabel(row), row.evaluator ? `평가자 ${row.evaluator}` : ''].filter(Boolean).join(' · ')}
@@ -2016,7 +2609,7 @@ function TeacherApp({
                         )}
                         {row.comment && <p className="text-xs text-neutral-500 mt-2 line-clamp-2 whitespace-pre-line">{row.comment}</p>}
                       </td>
-                      <td className="block lg:table-cell lg:py-4 lg:pr-4 whitespace-nowrap text-xs lg:text-sm font-semibold lg:font-normal mt-2 lg:mt-0">{row.kind === 'self' ? '-' : optionLabel(row.kind, row.summary)}</td>
+                      <td className="block lg:table-cell lg:py-4 lg:pr-4 whitespace-nowrap text-xs lg:text-sm font-semibold lg:font-normal mt-2 lg:mt-0">{row.kind === 'self' ? '-' : optionLabel(row)}</td>
                       <td className="absolute top-3 right-0 lg:static lg:table-cell lg:py-4">
                         <button
                           type="button"
@@ -2050,12 +2643,14 @@ function TeacherApp({
       const point: Record<string, string | number> = { axis: axis.label };
       KINDS.forEach((k) => {
         const row = latest[k];
-        point[k] = row ? axisRate(row, axis) : 0;
+        point[k] = row ? axisRate(row, axis) ?? 0 : 0;
       });
       return point;
     });
 
-    const gapRows = INTEGRATED_AXES.map((axis) => {
+    const showPerformance =
+      (latest.ojt !== null && formOf(latest.ojt) === 'ojt_senior') || (latest.self !== null && formOf(latest.self) === 'self_senior');
+    const gapRows = [...INTEGRATED_AXES, ...(showPerformance ? [PERFORMANCE_AXIS] : [])].map((axis) => {
       const v: Record<Kind, number | null> = {
         ojt: latest.ojt ? axisRate(latest.ojt, axis) : null,
         teacher: latest.teacher ? axisRate(latest.teacher, axis) : null,
@@ -2070,10 +2665,11 @@ function TeacherApp({
         else notes.push('3자 인식 일치');
       }
       if (v.ojt !== null && v.teacher !== null && Math.abs(v.ojt - v.teacher) >= 20) notes.push('현장·교내 차이 큼');
+      if (axis.key === 'performance') notes.push('취업 실습 양식 전용 · 차트 제외');
       return { axis, v, note: notes.join(' / ') || '-' };
     });
 
-    const performance = latest.ojt ? domainRate(latest.ojt, RUBRICS.ojt.domains[3]) : null;
+    const performance = latest.ojt && formOf(latest.ojt) === 'ojt_senior' ? domainRate(latest.ojt, FORMS.ojt_senior.domains[3]) : null;
     const cell = (n: number | null) => (n === null ? '-' : `${n}%`);
 
     return (
@@ -2110,13 +2706,13 @@ function TeacherApp({
                     : 'border-t border-neutral-200 lg:border-t-0 print:border-t-0 lg:px-4 print:px-4 lg:border-l-2 print:border-l-2 lg:border-neutral-900 print:border-neutral-900'
                 }`}>
                 <p className="text-xs text-neutral-500">
-                  최신 {RUBRICS[k].label} {row ? `· ${row.evaluated_at}` : ''}
+                  최신 {KIND_LABEL[k]} {row ? `· ${row.evaluated_at}` : ''}
                 </p>
                 {row ? (
                   <>
                     <p className="text-3xl font-black tabular-nums mt-1">{overallRate(row)}%</p>
                     <p className="text-xs font-semibold mt-1">
-                      {k === 'self' ? `${RUBRICS.self.max}점 척도 자기평가` : optionLabel(k, row.summary)}
+                      {k === 'self' ? `${rubricOf(row).max}점 척도 자기평가` : optionLabel(row)}
                       {k === 'ojt' && performance !== null ? ` · 직무 성과 ${performance}%` : ''}
                     </p>
                     {k === 'ojt' && sourceLabel(row) && <p className="text-[11px] text-neutral-500 mt-0.5">{sourceLabel(row)}</p>}
@@ -2185,9 +2781,9 @@ function TeacherApp({
               </tbody>
             </table>
             <p className="text-[10px] text-neutral-500 mt-3 leading-relaxed">
-              세 평가는 척도(4점·4점·3점)와 항목이 달라 의미가 같은 항목끼리 묶어 달성률로 환산했습니다. 고용주 평가의 직무 성과
-              영역은 비교 대상이 없어 상단 고용주 칸에 따로 표시합니다. 학생 값이 다른 두 평가 평균보다 20%p 이상 차이 나면 인식
-              차이로 표시합니다.
+              세 평가는 척도(4점·4점·3점)와 항목이 달라 의미가 같은 항목끼리 묶어 달성률로 환산했으며, '관찰 기회 없음' 항목은
+              계산에서 제외했습니다. 직무 성과·유연성은 취업 실습 양식(고3·전공과)에만 있어 차트에서 빼고 비교표에만 표시합니다. 학생
+              값이 다른 평가 평균보다 20%p 이상 차이 나면 인식 차이로 표시합니다.
             </p>
           </div>
         </section>
@@ -2687,7 +3283,7 @@ function TeacherApp({
                 <div className="min-w-0">
                   <p className="text-[11px] text-neutral-400">새 평가 도착</p>
                   <p className="text-sm font-bold mt-0.5 truncate">
-                    {a.studentName} · {RUBRICS[a.kind].label}
+                    {a.studentName} · {KIND_LABEL[a.kind]}
                   </p>
                   <p className="text-xs text-neutral-300 mt-1">
                     종합 {a.rate}%{a.evaluator ? ` · 평가자 ${a.evaluator}` : ''}
