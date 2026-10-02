@@ -33,6 +33,8 @@ import {
   RefreshCw,
   Users,
   UserCog,
+  Undo2,
+  RotateCcw,
   Search,
   ChevronDown,
   ChevronRight,
@@ -55,6 +57,7 @@ const IS_DEMO = urlParams.get('demo') === '1';
 const DEMO_STORAGE_KEY = 'linkro-demo-db-v1';
 const DEMO_USER_ID = 'demo-teacher';
 const DEMO_SUFFIX = IS_DEMO ? '&demo=1' : '';
+const TRASH_DAYS = 30; // 휴지통 보관 기간
 const supabase = IS_DEMO
   ? (createDemoClient(!['ojt', 'self', 'intro'].includes(urlParams.get('view') ?? '')) as unknown as ReturnType<typeof createClient>)
   : createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
@@ -63,7 +66,7 @@ const STUDENTS_TABLE = 'portfolio_students';
 const EVALUATIONS_TABLE = 'portfolio_evaluations';
 const PROFILES_TABLE = 'portfolio_profiles';
 const EVAL_COLUMNS = 'id, student_id, kind, form, scores, summary, comment, evaluator, input_method, evaluated_at, created_at';
-const STUDENT_COLUMNS = 'id, name, grade, main_field, site, created_at, self_token, employer_token, intro, share_token';
+const STUDENT_COLUMNS = 'id, name, grade, main_field, site, created_at, self_token, employer_token, intro, share_token, deleted_at';
 const PROFILE_COLUMNS = 'id, email, name, school, role, created_at, contact, consent_version, consented_at';
 
 // ─────────────────────────────────────────────
@@ -138,6 +141,7 @@ type Student = {
   employerToken: string; // 사장님 평가 링크용
   intro: Intro; // 사장님을 위한 학생소개서
   shareToken: string | null; // 학생소개서 공유 링크 (null = 공유 안 함)
+  deletedAt: string | null; // 휴지통으로 옮긴 시각 (null = 사용 중)
   evaluations: EvaluationRow[];
 };
 
@@ -157,6 +161,7 @@ type StudentRow = {
   employer_token: string;
   intro: unknown;
   share_token: string | null;
+  deleted_at: string | null;
   portfolio_evaluations: RawEvaluationRow[] | null;
 };
 
@@ -913,6 +918,7 @@ const toStudent = (row: StudentRow): Student => ({
   selfToken: row.self_token,
   intro: parseIntro(row.intro),
   shareToken: row.share_token ?? null,
+  deletedAt: row.deleted_at ?? null,
   employerToken: row.employer_token,
   evaluations: (row.portfolio_evaluations ?? []).map(normalizeEval).sort(byTimeAsc),
 });
@@ -2240,7 +2246,11 @@ function TeacherApp({
   onProfileUpdated: (p: Profile) => void;
 }) {
   const isAdmin = profile.role === 'admin';
-  const [students, setStudents] = useState<Student[]>([]);
+  const [students, setStudents] = useState<Student[]>([]); // 사용 중인 학생
+  const [trashed, setTrashed] = useState<Student[]>([]); // 휴지통 (30일 보관)
+  const [showTrash, setShowTrash] = useState(false);
+  const [undoStudent, setUndoStudent] = useState<Student | null>(null); // 방금 휴지통으로 옮긴 학생
+  const undoTimer = useRef<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -2318,8 +2328,13 @@ function TeacherApp({
     if (error) {
       setLoadError(`데이터를 불러오지 못했습니다: ${error.message}`);
     } else {
-      const list = ((data ?? []) as unknown as StudentRow[]).map(toStudent);
+      const all = ((data ?? []) as unknown as StudentRow[]).map(toStudent);
+      const cutoff = Date.now() - TRASH_DAYS * 24 * 60 * 60 * 1000;
+      const expired = all.filter((st) => st.deletedAt && new Date(st.deletedAt).getTime() < cutoff);
+      for (const st of expired) await supabase.from(STUDENTS_TABLE).delete().eq('id', st.id);
+      const list = all.filter((st) => !st.deletedAt);
       setStudents(list);
+      setTrashed(all.filter((st) => st.deletedAt && !expired.includes(st)));
       setSelectedId((prev) => (prev && list.some((s) => s.id === prev) ? prev : list[0]?.id ?? null));
     }
     setLoading(false);
@@ -2456,16 +2471,46 @@ function TeacherApp({
   };
 
   const handleDeleteStudent = async (student: Student) => {
-    if (!window.confirm(`${student.name} 학생과 모든 평가 기록을 삭제합니다. 되돌릴 수 없습니다. 계속할까요?`)) return;
+    if (!window.confirm(`${student.name} 학생을 휴지통으로 옮길까요?\n${TRASH_DAYS}일 안에는 [휴지통]에서 평가 기록까지 그대로 되살릴 수 있습니다.`)) return;
+    const deletedAt = new Date().toISOString();
+    const { error } = await supabase.from(STUDENTS_TABLE).update({ deleted_at: deletedAt }).eq('id', student.id);
+    if (error) {
+      window.alert(`휴지통으로 옮기지 못했습니다: ${error.message}`);
+      return;
+    }
+    const remaining = students.filter((s) => s.id !== student.id);
+    setStudents(remaining);
+    setTrashed((prev) => [{ ...student, deletedAt }, ...prev]);
+    if (selectedId === student.id) setSelectedId(remaining[0]?.id ?? null);
+    setUndoStudent(student);
+    if (undoTimer.current) window.clearTimeout(undoTimer.current);
+    undoTimer.current = window.setTimeout(() => setUndoStudent(null), 10000);
+  };
+
+  const restoreStudent = async (student: Student) => {
+    const { error } = await supabase.from(STUDENTS_TABLE).update({ deleted_at: null }).eq('id', student.id);
+    if (error) {
+      window.alert(`되살리지 못했습니다: ${error.message}`);
+      return;
+    }
+    setTrashed((prev) => prev.filter((s) => s.id !== student.id));
+    setStudents((prev) => [...prev, { ...student, deletedAt: null }]);
+    setUndoStudent((u) => (u?.id === student.id ? null : u));
+    setSelectedId(student.id);
+  };
+
+  const purgeStudent = async (student: Student) => {
+    if (!window.confirm(`${student.name} 학생과 모든 평가 기록을 완전히 삭제합니다. 이 작업은 되돌릴 수 없습니다. 계속할까요?`)) return;
     const { error } = await supabase.from(STUDENTS_TABLE).delete().eq('id', student.id);
     if (error) {
       window.alert(`삭제하지 못했습니다: ${error.message}`);
       return;
     }
-    const remaining = students.filter((s) => s.id !== student.id);
-    setStudents(remaining);
-    if (selectedId === student.id) setSelectedId(remaining[0]?.id ?? null);
+    setTrashed((prev) => prev.filter((s) => s.id !== student.id));
   };
+
+  const daysLeft = (deletedAt: string) =>
+    Math.max(0, TRASH_DAYS - Math.floor((Date.now() - new Date(deletedAt).getTime()) / (24 * 60 * 60 * 1000)));
 
   // ── 새 평가 저장 (누적 insert) ──
   const changeDraftKind = (kind: StaffKind) => {
@@ -2936,6 +2981,62 @@ function TeacherApp({
           <ul className="divide-y divide-neutral-200">{filteredStudents.map((st) => renderStudentItem(st))}</ul>
         )}
       </div>
+
+      {trashed.length > 0 && (
+        <div>
+          <button
+            type="button"
+            onClick={() => setShowTrash((v) => !v)}
+            aria-expanded={showTrash}
+            className="w-full flex items-center justify-between py-2.5 border-b-2 border-neutral-300 text-sm font-bold text-neutral-600 hover:text-neutral-900"
+          >
+            <span className="flex items-center gap-1.5">
+              {showTrash ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+              <Trash2 size={14} /> 휴지통
+            </span>
+            <span className="font-normal text-xs">{trashed.length}명</span>
+          </button>
+          {showTrash && (
+            <>
+              <p className="text-[11px] text-neutral-500 mt-2 leading-relaxed">
+                휴지통의 학생은 {TRASH_DAYS}일 뒤 자동으로 완전히 삭제됩니다. 보관 중에는 사장님·학생 링크와 공유 링크가 열리지 않습니다.
+              </p>
+              <ul className="divide-y divide-neutral-200 mt-1">
+                {trashed.map((st) => (
+                  <li key={st.id} className="py-3 flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-neutral-600 truncate">
+                        {st.name} <span className="text-xs font-normal">{st.grade}</span>
+                      </p>
+                      <p className="text-[11px] text-neutral-400">
+                        평가 {st.evaluations.length}건 · {st.deletedAt ? `${daysLeft(st.deletedAt)}일 후 완전 삭제` : ''}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => restoreStudent(st)}
+                        className="flex items-center gap-1 border-2 border-neutral-900 px-2 py-1 text-xs font-bold hover:bg-neutral-900 hover:text-white transition-colors"
+                      >
+                        <RotateCcw size={12} /> 되살리기
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => purgeStudent(st)}
+                        aria-label={`${st.name} 완전 삭제`}
+                        title="완전 삭제"
+                        className="p-1.5 text-neutral-400 hover:text-neutral-900 hover:bg-neutral-100"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </div>
+      )}
     </aside>
   );
 
@@ -4004,7 +4105,7 @@ function TeacherApp({
   );
 
   // ── 내 정보 화면 (이름·학교 수정 / 비밀번호 변경 / 회원 탈퇴, 이메일은 변경 불가) ──
-  const totalEvaluations = students.reduce((sum, s) => sum + s.evaluations.length, 0);
+  const totalEvaluations = [...students, ...trashed].reduce((sum, s) => sum + s.evaluations.length, 0);
   const msgLine = (m: FormMessage | null) =>
     m ? (
       <p className={`text-xs border-l-4 pl-2 py-0.5 ${m.type === 'error' ? 'border-neutral-900 font-semibold' : 'border-neutral-400 text-neutral-700'}`}>
@@ -4113,7 +4214,7 @@ function TeacherApp({
             <div className="space-y-4">
               <div className="border-2 border-neutral-900 p-5 text-sm leading-relaxed space-y-2">
                 <p>
-                  탈퇴하면 계정과 함께 <b>등록한 학생 {students.length}명, 평가 기록 {totalEvaluations}건</b>이 모두 삭제되며 되돌릴 수
+                  탈퇴하면 계정과 함께 <b>등록한 학생 {students.length + trashed.length}명, 평가 기록 {totalEvaluations}건</b>이 모두 삭제되며 되돌릴 수
                   없습니다.
                 </p>
                 <p className="text-neutral-600">
@@ -4205,8 +4306,22 @@ function TeacherApp({
 
       {renderBottomNav()}
 
-      {arrivals.length > 0 && (
+      {(arrivals.length > 0 || undoStudent) && (
         <div className="fixed bottom-20 inset-x-4 md:inset-x-auto md:bottom-6 md:right-6 md:w-80 z-50 space-y-2 print:hidden" role="status" aria-live="polite">
+          {undoStudent && (
+            <div className="bg-neutral-900 text-white p-4 shadow-lg flex items-center justify-between gap-3">
+              <p className="text-sm min-w-0">
+                <b>{undoStudent.name}</b> 학생을 휴지통으로 옮겼습니다.
+              </p>
+              <button
+                type="button"
+                onClick={() => restoreStudent(undoStudent)}
+                className="shrink-0 flex items-center gap-1 border border-white px-3 py-1.5 text-xs font-bold hover:bg-white hover:text-neutral-900 transition-colors"
+              >
+                <Undo2 size={13} /> 되돌리기
+              </button>
+            </div>
+          )}
           {arrivals.map((a) => (
             <div key={a.id} className="bg-neutral-900 text-white p-4 shadow-lg">
               <div className="flex justify-between items-start gap-3">
@@ -4356,6 +4471,7 @@ function createDemoClient(reset: boolean) {
         employer_token: crypto.randomUUID(),
         intro: {},
         share_token: null,
+        deleted_at: null,
         ...p,
       };
     if (key === 'evaluations')
@@ -4455,7 +4571,7 @@ function createDemoClient(reset: boolean) {
 
   const rpc = async (fn: string, args: DemoRow): Promise<DemoResult> => {
     const db = load();
-    const byToken = (field: string) => db.students.find((s) => s[field] === args.p_token);
+    const byToken = (field: string) => db.students.find((s) => s[field] === args.p_token && !s.deleted_at);
     const tokenField = args.p_kind === 'ojt' ? 'employer_token' : 'self_token';
     if (fn === 'get_link_context') {
       const s = byToken(tokenField);
