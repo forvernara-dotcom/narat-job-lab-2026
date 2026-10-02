@@ -49,7 +49,15 @@ import {
 const SUPABASE_URL = 'https://rvhnvvszispxyrjdihqj.supabase.co';
 const SUPABASE_ANON_KEY =
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ2aG52dnN6aXNweHlyamRpaHFqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA3ODEyMDMsImV4cCI6MjEwNjM1NzIwM30.1M4yy-NQ6k2ZuUJRz6pcl1JLdn8NC-1kIubfXvpknJQ';
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// 시연 모드: 주소 뒤에 ?demo=1 → 예시 데이터로 동작 (맨 아래 '8. 시연 모드' 참고)
+const urlParams = new URLSearchParams(window.location.search);
+const IS_DEMO = urlParams.get('demo') === '1';
+const DEMO_STORAGE_KEY = 'linkro-demo-db-v1';
+const DEMO_USER_ID = 'demo-teacher';
+const DEMO_SUFFIX = IS_DEMO ? '&demo=1' : '';
+const supabase = IS_DEMO
+  ? (createDemoClient(!['ojt', 'self', 'intro'].includes(urlParams.get('view') ?? '')) as unknown as ReturnType<typeof createClient>)
+  : createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 const STUDENTS_TABLE = 'portfolio_students';
 const EVALUATIONS_TABLE = 'portfolio_evaluations';
@@ -887,7 +895,7 @@ const emptyDraft = (kind: StaffKind): Draft => ({
   evaluator: '',
 });
 const linkFor = (kind: LinkKind, token: string) =>
-  `${window.location.origin}${window.location.pathname}?view=${kind}&t=${encodeURIComponent(token)}`;
+  `${window.location.origin}${window.location.pathname}?view=${kind}&t=${encodeURIComponent(token)}${DEMO_SUFFIX}`;
 
 const normalizeEval = (raw: RawEvaluationRow): EvaluationRow => ({
   ...raw,
@@ -935,6 +943,7 @@ export default function App() {
     return (
       <>
         <style>{PRINT_CSS}</style>
+        {IS_DEMO && <DemoBanner />}
         <SharedProfilePage token={token} />
       </>
     );
@@ -942,6 +951,7 @@ export default function App() {
   return (
     <>
       <style>{PRINT_CSS}</style>
+      {IS_DEMO && <DemoBanner />}
       {linkKind && token ? <LinkEvaluationPage kind={linkKind} token={token} /> : <AuthGate />}
     </>
   );
@@ -1448,7 +1458,7 @@ const parseShared = (raw: unknown): ShareData | null => {
 };
 
 const introLink = (token: string) =>
-  `${window.location.origin}${window.location.pathname}?view=intro&t=${encodeURIComponent(token)}`;
+  `${window.location.origin}${window.location.pathname}?view=intro&t=${encodeURIComponent(token)}${DEMO_SUFFIX}`;
 
 // 이미지 저장: 휴대폰은 공유 창(카카오톡·사진 저장), 컴퓨터는 파일로 내려받기
 const exportImage = async (node: HTMLElement, filename: string) => {
@@ -4254,6 +4264,487 @@ function SeriesLegend() {
           </span>
         );
       })}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────
+// 8. 시연 모드 (?demo=1)
+//   · 로그인 없이 예시 선생님 계정과 예시 학생으로 동작 (관리자 메뉴 없음)
+//   · 데이터는 이 브라우저 안에만 저장되고 실제 DB에는 저장하지 않음
+//   · 선생님 화면을 새로고침하면 처음 상태로 돌아감
+//   · 같은 브라우저의 다른 탭에서 사장님·학생 링크로 제출하면 선생님 탭에 실시간 알림
+// ─────────────────────────────────────────────
+type DemoRow = Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+type DemoDB = { students: DemoRow[]; evaluations: DemoRow[]; profiles: DemoRow[] };
+type DemoResult = { data: any; error: { message: string } | null }; // eslint-disable-line @typescript-eslint/no-explicit-any
+type DemoListener = { event: string; table: string; cb: (payload: { new: DemoRow; old: DemoRow }) => void };
+type DemoBuilder = {
+  select: (cols?: string) => DemoBuilder;
+  insert: (v: DemoRow) => DemoBuilder;
+  update: (v: DemoRow) => DemoBuilder;
+  delete: () => DemoBuilder;
+  eq: (col: string, v: unknown) => DemoBuilder;
+  order: (col: string, opts?: { ascending?: boolean }) => DemoBuilder;
+  single: () => DemoBuilder;
+  maybeSingle: () => DemoBuilder;
+  then: (resolve: (r: DemoResult) => unknown, reject?: (e: unknown) => unknown) => Promise<unknown>;
+};
+type DemoChannel = {
+  on: (type: string, filter: { event: string; table: string }, cb: DemoListener['cb']) => DemoChannel;
+  subscribe: (statusCb?: (status: string) => void) => DemoChannel;
+  mine: DemoListener[];
+};
+
+function createDemoClient(reset: boolean) {
+  let needsReset = reset; // 선생님 화면을 열 때마다 예시 데이터로 초기화 (링크 화면은 초기화하지 않음)
+  let memory: DemoDB | null = null;
+  const listeners: DemoListener[] = [];
+  const bc = typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('linkro-demo') : null;
+  const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v));
+  const TABLE_KEY: Record<string, keyof DemoDB> = {
+    portfolio_students: 'students',
+    portfolio_evaluations: 'evaluations',
+    portfolio_profiles: 'profiles',
+  };
+
+  const save = (db: DemoDB) => {
+    memory = db;
+    try {
+      localStorage.setItem(DEMO_STORAGE_KEY, JSON.stringify(db));
+    } catch {
+      // 저장소를 쓸 수 없으면 이 탭 안에서만 유지
+    }
+  };
+  const load = (): DemoDB => {
+    if (needsReset) {
+      needsReset = false;
+      const fresh = buildDemoSeed();
+      save(fresh);
+      return fresh;
+    }
+    try {
+      const raw = localStorage.getItem(DEMO_STORAGE_KEY);
+      if (raw) return JSON.parse(raw) as DemoDB;
+    } catch {
+      if (memory) return memory;
+    }
+    const fresh = memory ?? buildDemoSeed();
+    save(fresh);
+    return fresh;
+  };
+
+  const emitLocal = (event: string, table: string, row: DemoRow) => {
+    listeners
+      .filter((l) => l.event === event && l.table === table)
+      .forEach((l) => window.setTimeout(() => l.cb({ new: row, old: row }), 0));
+  };
+  const notify = (event: string, table: string, row: DemoRow) => {
+    emitLocal(event, table, row);
+    bc?.postMessage({ event, table, row });
+  };
+  if (bc) bc.onmessage = (e: MessageEvent) => emitLocal(e.data.event, e.data.table, e.data.row);
+
+  const withDefaults = (key: keyof DemoDB, p: DemoRow): DemoRow => {
+    const base = { id: crypto.randomUUID(), created_at: new Date().toISOString() };
+    if (key === 'students')
+      return {
+        ...base,
+        site: null,
+        teacher_id: DEMO_USER_ID,
+        self_token: crypto.randomUUID(),
+        employer_token: crypto.randomUUID(),
+        intro: {},
+        share_token: null,
+        ...p,
+      };
+    if (key === 'evaluations')
+      return { ...base, form: null, summary: null, comment: '', evaluator: null, input_method: null, evaluated_at: today(), ...p };
+    return { ...base, ...p };
+  };
+
+  const from = (table: string): DemoBuilder => {
+    const state = {
+      op: 'select' as 'select' | 'insert' | 'update' | 'delete',
+      payload: {} as DemoRow,
+      filters: [] as [string, unknown][],
+      order: null as null | { col: string; asc: boolean },
+      cols: '*',
+      mode: 'many' as 'many' | 'single' | 'maybe',
+    };
+    const run = (): DemoResult => {
+      const db = load();
+      const key = TABLE_KEY[table];
+      if (!key) return { data: null, error: { message: `unknown table: ${table}` } };
+      const match = (r: DemoRow) => state.filters.every(([c, v]) => r[c] === v);
+      let rows: DemoRow[] = [];
+      if (state.op === 'insert') {
+        const row = withDefaults(key, state.payload);
+        db[key].push(row);
+        save(db);
+        rows = [row];
+        if (key === 'evaluations') notify('INSERT', table, row);
+      } else if (state.op === 'update') {
+        rows = db[key].filter(match);
+        rows.forEach((r) => Object.assign(r, state.payload));
+        save(db);
+      } else if (state.op === 'delete') {
+        rows = db[key].filter(match);
+        db[key] = db[key].filter((r) => !match(r));
+        if (key === 'students') {
+          const ids = new Set(rows.map((r) => r.id));
+          db.evaluations.filter((e) => ids.has(e.student_id)).forEach((e) => notify('DELETE', 'portfolio_evaluations', { id: e.id }));
+          db.evaluations = db.evaluations.filter((e) => !ids.has(e.student_id));
+        }
+        if (key === 'evaluations') rows.forEach((r) => notify('DELETE', table, { id: r.id }));
+        save(db);
+      } else {
+        rows = db[key].filter(match);
+        if (state.order) {
+          const { col, asc } = state.order;
+          rows = [...rows].sort((a, b) => String(a[col]).localeCompare(String(b[col])) * (asc ? 1 : -1));
+        }
+        if (key === 'students' && state.cols.includes('portfolio_evaluations')) {
+          rows = rows.map((r) => ({ ...r, portfolio_evaluations: db.evaluations.filter((e) => e.student_id === r.id) }));
+        }
+      }
+      const out = clone(rows);
+      if (state.mode === 'single') return out.length ? { data: out[0], error: null } : { data: null, error: { message: '데이터를 찾을 수 없습니다.' } };
+      if (state.mode === 'maybe') return { data: out[0] ?? null, error: null };
+      return { data: out, error: null };
+    };
+    const builder: DemoBuilder = {
+      select: (cols = '*') => {
+        state.cols = cols;
+        return builder;
+      },
+      insert: (v) => {
+        state.op = 'insert';
+        state.payload = v;
+        return builder;
+      },
+      update: (v) => {
+        state.op = 'update';
+        state.payload = v;
+        return builder;
+      },
+      delete: () => {
+        state.op = 'delete';
+        return builder;
+      },
+      eq: (col, v) => {
+        state.filters.push([col, v]);
+        return builder;
+      },
+      order: (col, opts) => {
+        state.order = { col, asc: opts?.ascending ?? true };
+        return builder;
+      },
+      single: () => {
+        state.mode = 'single';
+        return builder;
+      },
+      maybeSingle: () => {
+        state.mode = 'maybe';
+        return builder;
+      },
+      then: (resolve, reject) => Promise.resolve().then(run).then(resolve, reject),
+    };
+    return builder;
+  };
+
+  const rpc = async (fn: string, args: DemoRow): Promise<DemoResult> => {
+    const db = load();
+    const byToken = (field: string) => db.students.find((s) => s[field] === args.p_token);
+    const tokenField = args.p_kind === 'ojt' ? 'employer_token' : 'self_token';
+    if (fn === 'get_link_context') {
+      const s = byToken(tokenField);
+      if (!s) return { data: [], error: null };
+      const isOjt = args.p_kind === 'ojt';
+      return { data: [{ name: s.name, grade: s.grade, main_field: isOjt ? s.main_field : null, site: isOjt ? s.site : null }], error: null };
+    }
+    if (fn === 'submit_link_evaluation') {
+      const s = byToken(tokenField);
+      if (!s) return { data: null, error: { message: 'invalid token' } };
+      const row = withDefaults('evaluations', {
+        student_id: s.id,
+        kind: args.p_kind,
+        form: args.p_form,
+        scores: args.p_scores,
+        summary: args.p_kind === 'ojt' ? args.p_summary : null,
+        comment: args.p_comment ?? '',
+        evaluator: args.p_evaluator ?? null,
+        input_method: 'link',
+      });
+      db.evaluations.push(row);
+      save(db);
+      notify('INSERT', 'portfolio_evaluations', row);
+      return { data: null, error: null };
+    }
+    if (fn === 'get_shared_profile') {
+      const s = byToken('share_token');
+      if (!s) return { data: null, error: null };
+      const t = db.profiles.find((p) => p.id === s.teacher_id) ?? {};
+      const latest = (kind: string) => {
+        const list = db.evaluations
+          .filter((e) => e.student_id === s.id && e.kind === kind)
+          .sort((a, b) => `${a.evaluated_at}${a.created_at}`.localeCompare(`${b.evaluated_at}${b.created_at}`));
+        const e = list[list.length - 1];
+        return e ? { kind: e.kind, form: e.form, scores: e.scores, summary: e.summary, evaluated_at: e.evaluated_at } : null;
+      };
+      return {
+        data: {
+          name: s.name,
+          grade: s.grade,
+          main_field: s.main_field,
+          site: s.site,
+          intro: s.intro,
+          teacher: { name: t.name, school: t.school, contact: t.contact },
+          ojt: latest('ojt'),
+          training: latest('teacher'),
+        },
+        error: null,
+      };
+    }
+    if (fn === 'delete_my_portfolio_account') return { data: null, error: { message: '시연 모드에서는 탈퇴할 수 없습니다.' } };
+    return { data: null, error: { message: `unknown rpc: ${fn}` } };
+  };
+
+  const session = { user: { id: DEMO_USER_ID, email: 'demo@linkro.kr' } };
+  const unavailable = (what: string) => async () => ({ data: { session: null }, error: { message: `시연 모드에서는 ${what}할 수 없습니다.` } });
+  const auth = {
+    getSession: async () => ({ data: { session }, error: null }),
+    onAuthStateChange: () => ({ data: { subscription: { unsubscribe: () => undefined } } }),
+    signInWithPassword: async () => ({ data: { session }, error: null }),
+    signUp: unavailable('가입'),
+    resetPasswordForEmail: unavailable('비밀번호를 재설정'),
+    updateUser: unavailable('비밀번호를 변경'),
+    signOut: async () => {
+      window.location.href = window.location.pathname; // 로그아웃 = 시연 종료
+      return { error: null };
+    },
+  };
+
+  const channel = (): DemoChannel => {
+    const ch: DemoChannel = {
+      mine: [],
+      on: (_type, filter, cb) => {
+        ch.mine.push({ event: filter.event, table: filter.table, cb });
+        return ch;
+      },
+      subscribe: (statusCb) => {
+        listeners.push(...ch.mine);
+        window.setTimeout(() => statusCb?.('SUBSCRIBED'), 0);
+        return ch;
+      },
+    };
+    return ch;
+  };
+  const removeChannel = async (ch: DemoChannel) => {
+    ch.mine.forEach((l) => {
+      const i = listeners.indexOf(l);
+      if (i >= 0) listeners.splice(i, 1);
+    });
+    return 'ok';
+  };
+
+  return { from, rpc, auth, channel, removeChannel };
+}
+
+// 시연용 예시 데이터 (날짜는 오늘을 기준으로 자동 계산)
+function buildDemoSeed(): DemoDB {
+  const ago = (n: number) => {
+    const d = new Date();
+    d.setDate(d.getDate() - n);
+    const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+    return local.toISOString().slice(0, 10);
+  };
+  const scoresOf = (form: FormKey, values: number[]) =>
+    Object.fromEntries(allItems(FORMS[form]).map((item, i) => [item.id, values[i] ?? 3]));
+  let seq = 0;
+  const ev = (studentNo: number, kind: Kind, form: FormKey, days: number, values: number[], extra: DemoRow = {}): DemoRow => {
+    seq += 1;
+    return {
+      id: `demo-ev-${seq}`,
+      student_id: `demo-st-${studentNo}`,
+      kind,
+      form,
+      scores: scoresOf(form, values),
+      summary: null,
+      comment: '',
+      evaluator: null,
+      input_method: kind === 'self' ? 'link' : null,
+      evaluated_at: ago(days),
+      created_at: `${ago(days)}T09:${String(seq).padStart(2, '0')}:00.000Z`,
+      ...extra,
+    };
+  };
+  const token = (group: number, n: number) => `00000000-0000-4000-8000-000000000${group}${String(n).padStart(2, '0')}`;
+  const st = (n: number, name: string, grade: string, main_field: string, site: string | null, intro: DemoRow = {}, share = false): DemoRow => ({
+    id: `demo-st-${n}`,
+    name,
+    grade,
+    main_field,
+    site,
+    created_at: `2026-03-0${n}T09:00:00.000Z`,
+    teacher_id: DEMO_USER_ID,
+    self_token: token(1, n),
+    employer_token: token(2, n),
+    intro,
+    share_token: share ? token(3, n) : null,
+  });
+
+  const students = [
+    st(
+      1,
+      '김민준',
+      '고2',
+      '바리스타 보조',
+      '온가든 카페',
+      {
+        headline: '성실한 예비 바리스타 김민준입니다',
+        keywords: ['끝까지 해내는 끈기', '밝은 인사', '위생 수칙 철저'],
+        strength: '한 번 배운 음료 레시피는 순서를 정확히 지켜 끝까지 완성합니다. 매장 정리와 설거지 같은 반복 업무를 바로 맡기셔도 됩니다.',
+        tip: '"이거 하고 저거 해"보다 "컵 10개를 닦으면, 다음에 테이블을 정리하세요"처럼 순서를 끊어서 말씀해 주세요.',
+        support: '주문이 몰리면 잠시 멈출 수 있습니다. "순서대로 하면 돼요" 한마디면 금세 페이스를 찾습니다.',
+        notes: { selfcare: '지각 0회, 복장 단정', receptive: '모르면 손을 들어 질문함' },
+      },
+      true
+    ),
+    st(
+      2,
+      '이서연',
+      '전공과',
+      '제과제빵 보조',
+      '드림베이커리',
+      {
+        headline: '꼼꼼한 제과 보조 이서연입니다',
+        keywords: ['정확한 계량', '성실한 근태', '끝까지 집중'],
+        strength: '계량과 포장 작업의 정확도가 매우 높고, 한 번 익힌 공정은 끝까지 집중해서 완수합니다.',
+        tip: '작업 순서가 바뀔 때는 하루 전에 미리 알려 주시면 안정적으로 적응합니다.',
+        support: '처음 하는 일 앞에서 긴장하면 말수가 줄어듭니다. 시범을 한 번 보여 주시면 바로 따라 합니다.',
+        notes: { attitude: '지각 0회, 위생 기준 완벽', performance: '불량 0%, 속도는 요구량의 90%' },
+      },
+      true
+    ),
+    st(3, '박지호', '중3', '화장지 공장', null),
+    st(4, '최유나', '고3', '레스토랑 외식서비스', '레스토랑 다정'),
+    st(5, '정하늘', '고1', '사무 보조', '더불어삶'),
+    st(6, '한도윤', '중2', '물류 포장', null),
+  ];
+
+  const evaluations = [
+    // 김민준 (고2 · 저학년 양식)
+    ev(1, 'teacher', 'teacher', 60, [3, 3, 2, 2, 2, 1, 2, 3, 3, 3, 2], {
+      summary: 'basic',
+      comment: '[지도 목표] 도움 요청 카드를 사용해 모르는 상황을 알린다.\n[중재 계획] 교내 카페 실습 시작 전 요청 카드 사용을 시범 보인다.',
+    }),
+    ev(1, 'ojt', 'ojt_junior', 14, [4, 4, 3, 3, 3, 2, 3, 4, 4, 4, 0], {
+      summary: 'advanced',
+      input_method: 'link',
+      evaluator: '박온가 점장',
+      comment: '위생 수칙을 매번 잘 지키고 인사를 밝게 합니다. 주문이 몰릴 때 순서를 짚어 주면 잘 따라옵니다.',
+    }),
+    ev(1, 'self', 'self_junior', 13, [3, 3, 3, 3, 3, 2, 3, 3, 3], {
+      comment: '[오늘 내가 가장 잘한 점은?] 라떼를 10잔 만들었어요.\n[내일 나의 다짐 (목표)!] 모르면 먼저 물어볼게요.',
+    }),
+    ev(1, 'teacher', 'teacher', 10, [4, 3, 3, 3, 3, 2, 3, 4, 4, 3, 3], {
+      summary: 'advanced',
+      comment: '[지도 목표] 요청 카드 없이 말로 "도와주세요"를 요청한다 (주 3회 이상).\n[중재 계획] 실패 상황 역할극 후 진정 루틴을 연습하고 성공 시 즉시 칭찬한다.',
+    }),
+    // 이서연 (전공과 · 취업 실습 양식)
+    ev(2, 'ojt', 'ojt_senior', 55, [4, 4, 3, 3, 2, 3, 4, 3, 3, 4, 4, 3, 2, 3, 2, 3], {
+      summary: 'positive',
+      input_method: 'link',
+      evaluator: '이드림 실장',
+      comment: '계량이 꼼꼼합니다. 작업 순서가 바뀌면 불안해하니 미리 알려 주시면 좋겠습니다.',
+    }),
+    ev(2, 'teacher', 'teacher', 20, [4, 4, 4, 4, 4, 3, 4, 4, 4, 4, 3], {
+      summary: 'advanced',
+      comment: '[지도 목표] 낯선 공정에서도 먼저 질문한다.\n[중재 계획] 새 공정 투입 전 시범 1회와 사진 체크리스트를 제공한다.',
+    }),
+    ev(2, 'ojt', 'ojt_senior', 5, [4, 4, 4, 4, 3, 4, 4, 4, 3, 4, 4, 4, 3, 4, 3, 4], {
+      summary: 'hire',
+      input_method: 'link',
+      evaluator: '이드림 실장',
+      comment: '정확도가 매우 높고 한 번 익힌 공정은 끝까지 완수합니다. TO가 생기면 채용하고 싶습니다.',
+    }),
+    ev(2, 'self', 'self_senior', 4, [3, 3, 2, 3, 3, 3, 3, 2, 3, 2, 2], {
+      comment:
+        '[오늘 내가 가장 잘한 점은?] 쿠키 포장 100개를 실수 없이 했어요.\n[오늘 사장님(관리자)에게 칭찬받은 점은?] 계량이 정확하다고 칭찬받았어요.\n[내일 나의 다짐 (목표)!] 모르는 것은 먼저 질문하겠습니다.',
+    }),
+    // 박지호 (중3 · 교내 훈련 중심)
+    ev(3, 'teacher', 'teacher', 180, [2, 2, 1, 1, 2, 1, 1, 2, 2, 2, 1], {
+      summary: 'intensive',
+      comment: '[지도 목표] 시각 타이머를 보며 10분간 착석한다.\n[중재 계획] 착석 성공 시 토큰 강화, 이탈 시 휴식 카드 사용을 지도한다.',
+    }),
+    ev(3, 'teacher', 'teacher', 15, [2, 3, 2, 2, 2, 1, 2, 3, 3, 2, 1], {
+      summary: 'basic',
+      comment: '[지도 목표] 시각 타이머를 보며 20분간 착석하여 포장 과제를 유지한다.\n[중재 계획] 10개 단위 완료 체크보드와 "괜찮아, 다시" 카드를 사용한다.',
+    }),
+    ev(3, 'self', 'self_junior', 14, [3, 2, 1, 2, 2, 2, 3, 2, 1], {
+      comment: '[오늘 내가 가장 잘한 점은?] 휴지를 20개 접었어요.\n[내일 나의 다짐 (목표)!] 화가 나도 참을게요.',
+    }),
+    // 최유나 (고3 · 취업 실습 양식, 고용주 평가 대리 입력 예시)
+    ev(4, 'teacher', 'teacher', 30, [4, 4, 3, 4, 3, 3, 3, 3, 4, 4, 2], {
+      summary: 'advanced',
+      comment: '[지도 목표] 바쁜 시간대에도 주문 순서를 스스로 확인한다.\n[중재 계획] 주문표 확인 루틴을 교내 실습에서 반복한다.',
+    }),
+    ev(4, 'ojt', 'ojt_senior', 8, [4, 4, 4, 4, 3, 3, 4, 3, 2, 4, 4, 3, 3, 3, 2, 0], {
+      summary: 'positive',
+      input_method: 'phone',
+      evaluator: '정다정 점장',
+      comment: '손님 응대가 친절합니다. 점심시간처럼 바쁠 때 당황하는 모습이 있어 연습이 더 필요합니다.',
+    }),
+    // 정하늘 (고1 · 저학년 양식)
+    ev(5, 'teacher', 'teacher', 25, [3, 3, 3, 3, 2, 2, 3, 3, 3, 3, 3], {
+      summary: 'basic',
+      comment: '[지도 목표] 지적을 받았을 때 바로 방법을 바꿔 시도한다.\n[중재 계획] 피드백 후 "다시 해 볼게요" 말하기를 연습한다.',
+    }),
+    ev(5, 'ojt', 'ojt_junior', 3, [3, 4, 3, 3, 3, 2, 3, 3, 4, 3, 3], {
+      summary: 'basic',
+      input_method: 'link',
+      evaluator: '최더불 팀장',
+      comment: '서류 정리를 꼼꼼히 합니다. 막히면 혼자 멈춰 있는 경우가 있어 먼저 물어봐 주시면 좋겠습니다.',
+    }),
+    // 한도윤 (중2 · 아직 평가 없음)
+  ];
+
+  const profiles = [
+    {
+      id: DEMO_USER_ID,
+      email: 'demo@linkro.kr',
+      name: '김나라',
+      school: '나라고등학교',
+      role: 'teacher',
+      created_at: '2026-03-01T00:00:00.000Z',
+      contact: '010-0000-0000',
+      consent_version: CONSENT_VERSION,
+      consented_at: '2026-03-01T00:00:00.000Z',
+    },
+  ];
+
+  return { students, evaluations, profiles };
+}
+
+function DemoBanner() {
+  const isLinkPage = ['ojt', 'self', 'intro'].includes(urlParams.get('view') ?? '');
+  return (
+    <div className="bg-neutral-100 border-b-2 border-neutral-900 px-4 py-2 text-xs flex flex-wrap items-center justify-between gap-2 print:hidden">
+      <p>
+        <b>시연 모드</b> · 예시 데이터로 동작하며 실제 DB에는 저장되지 않습니다.
+        {isLinkPage ? '' : ' 새로고침하면 처음 상태로 돌아갑니다.'}
+      </p>
+      {!isLinkPage && (
+        <div className="flex gap-3">
+          <button type="button" onClick={() => window.location.reload()} className="underline font-semibold">
+            처음 상태로
+          </button>
+          <a href={window.location.pathname} className="underline">
+            시연 종료
+          </a>
+        </div>
+      )}
     </div>
   );
 }
